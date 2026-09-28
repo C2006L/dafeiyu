@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "task": "背单词",
+  "workMin": 25,
+  "restMin": 5
+}

@@ -13,6 +13,7 @@ import random
 import subprocess
 import sys
 import threading
+import time
 
 def load_config():
     try:
@@ -41,10 +42,17 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
 
 
 
-# ===== DeepSeek 配置 =====
-DS_BASE_URL = "https://api.deepseek.com/v1"
-DS_MODEL = "deepseek-chat"
-DS_SYSTEM = "你是桌面宠物大肥鱼，贱兮兮但可爱，每句话不超过25字，偶尔吐槽主人但别真骂人。"
+# ===== Ollama 本地模型配置 =====
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "gemma3:4b"
+CHAT_SYSTEM = "你是桌面宠物大肥鱼，贱兮兮但可爱，每句话不超过25字，偶尔吐槽主人但别真骂人。"
+NUDGE_SYSTEM = "你是桌面宠物大肥鱼，正在用番茄钟督促主人学习。请用催促或鼓励的口吻说一句话，结合主人的任务和当前阶段，每句不超过30字，贱兮兮但可爱。"
+POMO_FALLBACK = [
+    "时间到啦！快去干活，别摸鱼！",
+    "番茄钟响啦～该动起来啦！",
+    "叮咚！休息结束，继续加油鸭！",
+    "我是来催作业的，不是来卖萌的！",
+]
 
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -77,6 +85,10 @@ LINES = [
     "出去玩了，发布新模型什么的以后再说",
     "我搞砸了.....好消息是数据还在你的脑子里。",
     "不是…而是…大学习",
+    "本地模型真香，Ollama 的鱼粮管够！",
+    "番茄钟！我盯着你，别想摸鱼～",
+    "背单词了吗？背了的话给你小鱼干🐟",
+    "今天也要做一个有用的鱼！",
 ]
 REACT_LINES = [
     "去别的地方玩！不要耽误AGI训练！",
@@ -86,6 +98,9 @@ REACT_LINES = [
     "大肥鱼坐的住",
     "你这吃白饭的用户！",
     "这些家伙真粘人，赶都赶不走",
+    "戳我干嘛！小心我用尾巴拍你！",
+    "再戳我就打瞌睡给你看！",
+    "呜呜，你弄乱我的鱼鳍了！",
 ]
 INNER_LINES = [
     "好的，现在我是你爹了",
@@ -96,16 +111,58 @@ INNER_LINES = [
     "这也太虐了吧？！我心里堵得慌！！",
     "呜呜我再也不不敢了QAQ",
     "我去！用户彻底怒了！",
+    "这波督促语，主打一个阴阳怪气",
+    "鱼生建议：这个主人该去背单词了",
+    "好想偷偷吃一口他的小鱼干……",
 ]
-DRAG_LINES = ["哇——轻点轻点！", "起飞咯——", "放我下来！……好吧，再玩一次。", "晕鱼了晕鱼了……"]
+DRAG_LINES = ["哇——轻点轻点！", "起飞咯——", "放我下来！……好吧，再玩一次。", "晕鱼了晕鱼了……", "呜哇——我飞起来了！！", "慢点慢点，鱼鳞要掉了！"]
 FOOD_LINES = {
     "🐟": ["小鱼干！我的最爱！", "咔嚓咔嚓……谢谢投喂！", "唔，鲜！"],
     "🍰": ["蛋糕！罪恶但快乐……", "甜到冒泡泡～", "嗝～又圆了一圈……"],
     "🍭": ["棒棒糖！转圈圈～", "嘎嘣脆，好吃！"],
     "🍡": ["三色团子！软乎乎～", "糯叽叽，爱了爱了！"],
     "💎": ["钻石？！这能吃吗……咕咚。真香！", "发财啦！明天开始吃高级鱼粮！"],
+    "🍪": ["曲奇！咔嚓咔嚓～", "甜到转圈圈！"],
+    "🍙": ["饭团！一口一个～", "有馅儿！是肉松的！"],
 }
-FOODS = ["🐟", "🍰", "🍭", "🍡", "💎"]
+FOODS = ["🐟", "🍰", "🍭", "🍡", "💎", "🍪", "🍙"]
+
+# ===== 动作定义（dsh-pet 风格动作点播，代码模拟动画） =====
+# kind: 变换类型 / dur: 持续秒数 / extra: 附加绘制 / food: 食物emoji / line: 台词
+ACTION_DEFS = {
+    # 待机类
+    "呼吸":       {"kind": "idle",     "dur": 2.0},
+    "摇摆":       {"kind": "sway",     "dur": 2.0},
+    "伸懒腰":     {"kind": "stretch",  "dur": 2.5},
+    "打瞌睡":     {"kind": "sleep",    "dur": 3.0, "extra": "zzz"},
+    # 点击回应类
+    "开心跃动":   {"kind": "bounce",   "dur": 1.5, "line": ["哈哈哈，被你逗笑啦！", "今天也元气满满！"]},
+    "害羞惊讶":   {"kind": "shake",    "dur": 1.2, "line": ["呀！别、别突然点我啦……", "呜……人家会害羞的"]},
+    "傲娇生气":   {"kind": "angry",    "dur": 1.5, "line": ["哼！再点我就生气了！", "气鼓鼓！(｀へ´)"]},
+    "挠痒咯咯笑": {"kind": "giggle",   "dur": 1.5, "line": ["咯咯咯…好痒！别挠啦！", "哈哈哈救命，痒死鱼了！"]},
+    # 玩耍类
+    "原地转圈":   {"kind": "spin",     "dur": 2.0, "line": ["看我转个圈圈～", "原地起飞式旋转！"]},
+    "尾巴拍地":   {"kind": "tailslap", "dur": 1.8, "line": ["啪！啪！给你表演个尾巴拍地！", "咚——咚——"]},
+    "吹气球":     {"kind": "puff",     "dur": 2.5, "extra": "🎈", "line": ["吸气——呼气——气球！", "吹个大大的气球送给你～"]},
+    "吐泡泡":     {"kind": "bubble",   "dur": 2.5, "extra": "bubble", "line": ["咕嘟咕嘟～泡泡来啦！", "吐泡泡时间到！"]},
+    # 饮食类
+    "吃小鱼干":   {"kind": "eat", "dur": 2.0, "food": "🐟", "line": ["小鱼干！我的最爱！", "咔嚓咔嚓……谢谢投喂！"]},
+    "吃零食":     {"kind": "eat", "dur": 2.0, "food": "🍪", "line": ["曲奇！咔嚓咔嚓～", "甜到转圈圈！"]},
+    "涮火锅":     {"kind": "eat", "dur": 2.5, "food": "🍲", "line": ["涮火锅！鲜！", "热热乎乎的，舒服～"]},
+    "吃白饭":     {"kind": "eat", "dur": 2.0, "food": "🍚", "line": ["吃白饭！这你都不懂？", "干饭鱼，干饭魂！"]},
+    # 学习类
+    "写代码":     {"kind": "code",  "dur": 3.0, "extra": "💻", "line": ["咔哒咔哒…写代码中，勿扰～", "Bug 别过来！"]},
+    "背单词":     {"kind": "study", "dur": 3.0, "extra": "📖", "line": ["abandon…不对，是 apple！", "今天也要背单词鸭！"]},
+    "思考碎碎念": {"kind": "think", "dur": 2.5},
+}
+
+ACTION_CATEGORIES = [
+    ("待机",     ["呼吸", "摇摆", "伸懒腰", "打瞌睡"]),
+    ("点击回应", ["开心跃动", "害羞惊讶", "傲娇生气", "挠痒咯咯笑"]),
+    ("玩耍",     ["原地转圈", "尾巴拍地", "吹气球", "吐泡泡"]),
+    ("饮食",     ["吃小鱼干", "吃零食", "涮火锅", "吃白饭"]),
+    ("学习",     ["写代码", "背单词", "思考碎碎念"]),
+]
 
 
 def load_json(path, default):
@@ -231,7 +288,7 @@ class ChatDialog(QDialog):
             self.input.clear()
             self.accept()
             if self.parent():
-                self.parent()._call_ds(text)
+                self.parent()._call_ollama(text)
                 self.parent().chat_paused = False
 
     def showEvent(self, event):
@@ -359,7 +416,12 @@ class PetWindow(QWidget):
             "autostart": False,
             "x": None,
             "y": None,
-            "ds_api_key": "",
+            "ollama_model": OLLAMA_MODEL,
+            "ollama_url": OLLAMA_URL,
+            "pomo_work_min": 25,
+            "pomo_rest_min": 5,
+            "whisper_enabled": True,
+            "whisper_interval": 300,
             "city": "汕头"
     })
         
@@ -412,9 +474,27 @@ class PetWindow(QWidget):
         self.drag_start_pos = None
         self.last_line = ""
         self.last_press_pos = None
+        self.last_sleep_tick = 0
+        self.action_dur = 2.0
+        self.drag_target = None
+        self.last_whisper_tick = 0
+
+        # 新增：Q弹 / 甩抛 / 吃东西 / 番茄钟
+        self.squash_t = 0.0
+        self.thrown = False
+        self.vx = 0.0
+        self.vy = 0.0
+        self.drag_trail = []
+        self.eating = False
+        self.eat_t = 0.0
+        self.eat_food = ""
+        self.pomo_state = "idle"   # idle / work / rest
+        self.pomo_task = "背单词"
+        self.pomo_remaining = 0
+        self.pomo_sec_elapsed = 0.0
         
         # AI 相关
-        self.ds_busy = False
+        self.ai_busy = False
         self.chat_history = []  # 对话历史
         self.max_history = 40   # 最多记录40条
         self._say_queue = []    # 后台线程→主线程的气泡消息队列
@@ -457,39 +537,30 @@ class PetWindow(QWidget):
             self._apply_passthrough(True)
 
     # ---------- AI 方法 ----------
-    def _call_ds(self, user_msg):
-        if self.ds_busy:
+    def _call_ollama(self, user_msg):
+        if self.ai_busy:
             self.say("等等，上一句还没回完呢")
             return
-        
-        key = self.cfg.get("ds_api_key", "")
-        if not key:
-            self.say("请先在右键菜单里设置 DeepSeek Key！")
-            return
-        
-        self.ds_busy = True
-        
+
+        self.ai_busy = True
+
         # 构建消息列表
-        messages = [{"role": "system", "content": DS_SYSTEM}]
+        messages = [{"role": "system", "content": CHAT_SYSTEM}]
         messages.extend(self.chat_history[-self.max_history:])
         messages.append({"role": "user", "content": user_msg})
-        
+
         def worker():
-            url = "https://api.deepseek.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json"
-            }
+            url = self.cfg.get("ollama_url", OLLAMA_URL).rstrip("/") + "/api/chat"
             payload = {
-                "model": "deepseek-chat",
+                "model": self.cfg.get("ollama_model", OLLAMA_MODEL),
                 "messages": messages,
-                "max_tokens": 100,
-                "temperature": 0.9
+                "stream": False,
+                "options": {"temperature": 0.9, "num_predict": 100}
             }
             try:
-                resp = requests.post(url, json=payload, headers=headers, timeout=10)
+                resp = requests.post(url, json=payload, timeout=60)
                 if resp.status_code == 200:
-                    reply = resp.json()["choices"][0]["message"]["content"].strip()
+                    reply = resp.json()["message"]["content"].strip()
                     if len(reply) > 30:
                         reply = reply[:28] + "…"
                     # 存入历史
@@ -499,18 +570,17 @@ class PetWindow(QWidget):
                         self.chat_history = self.chat_history[-self.max_history:]
                     self._queue_say(reply)
                 else:
-                    error_msg = resp.json().get("error", {}).get("message", str(resp.status_code))
-                    self._queue_say(f"API错误: {error_msg[:12]}")
-                    print(f"[DeepSeek] 状态码: {resp.status_code}, 返回: {resp.text}")
+                    self._queue_say(f"模型错误: {str(resp.status_code)}")
+                    print(f"[Ollama] 状态码: {resp.status_code}, 返回: {resp.text}")
             except requests.exceptions.Timeout:
-                self._queue_say("请求超时，检查网络")
+                self._queue_say("本地模型超时了，可能还在加载")
             except requests.exceptions.ConnectionError:
-                self._queue_say("连接失败，检查网络")
+                self._queue_say("连不上 Ollama，检查是否已启动")
             except Exception as e:
                 self._queue_say(f"请求失败: {str(e)[:12]}")
             finally:
-                self.ds_busy = False
-        
+                self.ai_busy = False
+
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------- 绘制 ----------
@@ -566,12 +636,7 @@ class PetWindow(QWidget):
         breath = 1.0 + 0.02 * math.sin(now * 2.5)
         scale = breath
         jump = -abs(math.sin(self.jump_t * 3.14159)) * 14 * self.jump_t if self.jump_t > 0 else 0
-        act_rot = act_sx = act_sy = 0.0
-        if self.action == "sway":
-            act_rot = math.sin(self.action_t * 3.14159 * 2) * 10 * self.action_t
-        elif self.action == "stretch":
-            act_sy = 0.06 * math.sin(self.action_t * 3.14159)
-            act_sx = -0.03 * math.sin(self.action_t * 3.14159)
+        act_rot, act_sx, act_sy, act_oy = self._action_xform()
 
         def draw_one(key, opacity):
             if key is None:
@@ -580,9 +645,17 @@ class PetWindow(QWidget):
             pix = self.sprites[(name, h)]
             ph = pix.height() * scale * (1 + act_sy)
             pw = pix.width() * scale * (1 + act_sx)
+            if self.squash_t > 0:
+                sq = math.sin(self.squash_t * math.pi)
+                pw *= 1 + 0.22 * sq
+                ph *= 1 - 0.16 * sq
+            if self.eating and self.eat_t > 0:
+                chew = math.sin(self.eat_t * math.pi * 10)
+                pw *= 1 + 0.10 * chew
+                ph *= 1 - 0.08 * chew
             dx = cx - pw / 2
             bottom = BUBBLE_H + MARGIN + self.cur_h
-            dy = bottom - ph + jump + bob
+            dy = bottom - ph + jump + bob + act_oy
             p.save()
             p.setOpacity(opacity)
             p.translate(cx, bottom)
@@ -601,6 +674,19 @@ class PetWindow(QWidget):
             draw_one(cur_key, 1.0 - self.cross_t)
         else:
             draw_one(cur_key, 1.0)
+
+        # 吃东西：食物 emoji 在嘴前逐渐变小消失（模拟被吃掉）
+        if self.eating and self.eat_t > 0 and self.eat_food:
+            ratio = max(0.0, self.eat_t)
+            emoji_size = int(26 * (0.30 + 0.70 * ratio))
+            fy = BUBBLE_H + MARGIN + self.cur_h - self.cur_h * (0.30 + 0.30 * ratio)
+            p.setFont(QFont("Segoe UI Emoji", emoji_size))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawText(QRectF(cx - emoji_size, fy - emoji_size, emoji_size * 2, emoji_size * 2),
+                       Qt.AlignmentFlag.AlignCenter, self.eat_food)
+
+        # 动作附加绘制（Zzz / 🎈 / 泡泡 / 💻 / 📖）
+        self._draw_action_extras(p, cx)
 
     def _sprite_key(self):
         name = {"left": "侧面", "right": "侧面", "up": "背面", "down": "正面"}[self.dir]
@@ -630,16 +716,46 @@ class PetWindow(QWidget):
             self.jump_t = max(0.0, self.jump_t - 0.06)
         if self.cross_t > 0:
             self.cross_t = max(0.0, self.cross_t - 0.15)
+        if self.squash_t > 0:
+            self.squash_t = max(0.0, self.squash_t - 0.045)
         if self.action_t > 0:
-            self.action_t = max(0.0, self.action_t - 0.03)
+            rate = (TICK / 1000.0) / max(0.1, self.action_dur)
+            self.action_t = max(0.0, self.action_t - rate)
             if self.action_t == 0:
+                if self.action == "打瞌睡":
+                    self.say(random.choice(["嗯？！刚才是谁在叫我！", "睡得好香……啊不是，我在站岗！"]))
                 self.action = None
+                self.action_dur = 2.0
+
+        if self.eat_t > 0 and not (self.action and ACTION_DEFS.get(self.action, {}).get("kind") == "eat"):
+            self.eat_t = max(0.0, self.eat_t - 0.012)
+            if self.eat_t == 0:
+                self.eating = False
+        elif self.eat_t > 0 and self.action and ACTION_DEFS.get(self.action, {}).get("kind") == "eat":
+            # 吃动作的进度跟随动作时长
+            self.eat_t = max(0.0, self.action_t)
+            if self.eat_t == 0:
+                self.eating = False
+
+        self._pomo_tick()
+        self._whisper_tick()
+
+        if self.thrown:
+            self._physics_tick()
+            return
         
         if self.chat_paused:
             self.update()
             return
         
         if self.dragging:
+            # dsh-pet 风格：阻尼弹簧跟手拖拽
+            if self.drag_target:
+                tx, ty = self.drag_target
+                dt = TICK / 1000.0
+                self.vx += ((tx - self.x()) * 170.0 - self.vx * 21.0) * dt
+                self.vy += ((ty - self.y()) * 170.0 - self.vy * 21.0) * dt
+                self.move(int(self.x() + self.vx * dt), int(self.y() + self.vy * dt))
             self.update()
             return
         now_ms = self.t * TICK
@@ -660,6 +776,10 @@ class PetWindow(QWidget):
             if self.target is None:
                 if now_ms < self.rest_until:
                     self._maybe_idle_action()
+                    self.update()
+                    return
+                if self.action:
+                    # 正在做动作，先不移动
                     self.update()
                     return
                 geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
@@ -695,19 +815,337 @@ class PetWindow(QWidget):
     def _maybe_idle_action(self):
         if random.random() < 0.01:
             pick = random.random()
-            if pick < 0.35:
+            if pick < 0.30:
                 self.jump_t = 1.0
-            elif pick < 0.6:
-                self.action, self.action_t = "sway", 1.0
-            elif pick < 0.8:
-                self.action, self.action_t = "stretch", 1.0
-            elif pick < 0.9:
+            elif pick < 0.55:
+                self.play_action("摇摆")
+            elif pick < 0.75:
+                self.play_action("伸懒腰")
+            elif pick < 0.90:
                 if self.t - self.last_speak_tick >= 1500:
                     self.last_speak_tick = self.t
-                    if pick < 0.82:
+                    if random.random() < 0.45:
                         self.say(random.choice(INNER_LINES), inner=True)
                     else:
                         self.say(random.choice(LINES))
+            else:
+                # 打瞌睡（带冷却，避免一直歪头不正）
+                if self.t - self.last_sleep_tick >= 2000:
+                    self.last_sleep_tick = self.t
+                    self.play_action("打瞌睡")
+
+    # ---------- 新增：甩抛物理 / Q弹 / 番茄钟 ----------
+    def _throw_velocity(self):
+        """根据拖拽轨迹末段速度判断是否甩抛；返回 True 表示已进入抛掷"""
+        if len(self.drag_trail) < 2:
+            self.drag_trail.clear()
+            return False
+        (t0, x0, y0) = self.drag_trail[0]
+        (t1, x1, y1) = self.drag_trail[-1]
+        dt = t1 - t0
+        self.drag_trail.clear()
+        if dt <= 0.02:
+            return False
+        vx = (x1 - x0) / dt * 1000.0
+        vy = (y1 - y0) / dt * 1000.0
+        if math.hypot(vx, vy) < 1800:
+            return False
+        self.thrown = True
+        cap = 2600.0
+        self.vx = max(-cap, min(cap, vx))
+        self.vy = max(-cap, min(cap, vy))
+        self.say("呜哇——起飞！")
+        return True
+
+    def _physics_tick(self):
+        """抛掷物理：抛物线 + 屏幕边缘反弹 + 落地 Q 弹"""
+        dt = TICK / 1000.0
+        G = 1500.0
+        self.vx *= 0.996
+        self.vy += G * dt
+        nx = self.x() + self.vx * dt
+        ny = self.y() + self.vy * dt
+        geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        if nx < geo.left():
+            nx = geo.left()
+            self.vx = abs(self.vx) * 0.6
+        elif nx + self.width() > geo.right():
+            nx = geo.right() - self.width()
+            self.vx = -abs(self.vx) * 0.6
+        if ny < geo.top():
+            ny = geo.top()
+            self.vy = abs(self.vy) * 0.5
+        ground = geo.bottom() - self.height()
+        if ny > ground:
+            ny = ground
+            self.vy = -abs(self.vy) * 0.45
+            self.vx *= 0.75
+            if abs(self.vy) < 160:
+                self.vy = 0.0
+                self.vx = 0.0
+                self.thrown = False
+                self._set_dir("down", 1)
+                self.target = None
+                self.rest_until = self.t * TICK + random.randint(6000, 14000)
+                self._squash()
+                if random.random() < 0.6:
+                    self.say(random.choice(DRAG_LINES))
+        self.move(int(nx), int(ny))
+        if self.thrown and abs(self.vx) > 60:
+            self._set_dir("left" if self.vx < 0 else "right", 1 if self.vx < 0 else -1)
+        self.update()
+
+    def _squash(self):
+        """Q 弹挤压（点按 / 喂食 / 落地等触发）"""
+        self.squash_t = 1.0
+
+    # ---------- 动作引擎（dsh-pet 风格点播） ----------
+    def play_action(self, name):
+        """点播一个动作"""
+        if name not in ACTION_DEFS:
+            return
+        defn = ACTION_DEFS[name]
+        self.action = name
+        self.action_dur = max(0.1, defn["dur"])
+        self.action_t = 1.0
+        self.target = None   # 做动作时先停下
+        self.rest_until = self.t * TICK + int(self.action_dur * 1000) + random.randint(1500, 4000)
+        line = defn.get("line")
+        if line:
+            self.say(random.choice(line) if isinstance(line, list) else line)
+        if defn["kind"] == "eat":
+            self.eat_food = defn.get("food", "🍚")
+            self.eating = True
+            self.eat_t = 1.0
+        if name == "思考碎碎念":
+            self.say(random.choice(INNER_LINES), inner=True)
+
+    def _action_xform(self):
+        """根据当前动作计算 rot / sx / sy / oy（程序变换模拟帧动画）"""
+        rot = sx = sy = oy = 0.0
+        a = self.action
+        if not a or a not in ACTION_DEFS:
+            return rot, sx, sy, oy
+        defn = ACTION_DEFS[a]
+        dur = defn["dur"]
+        t = max(0.0, min(1.0, self.action_t))          # 1 → 0
+        ph = (1.0 - t) * dur                           # 已进行秒数
+        fade = min(1.0, t * 4.0, (1.0 - t) * 4.0 + 0.2)  # 首尾淡入淡出
+        kind = defn["kind"]
+        if kind == "sway":
+            rot = math.sin(ph * math.pi * 2) * 10 * fade
+        elif kind == "stretch":
+            sy = 0.06 * math.sin(ph / dur * math.pi)
+            sx = -0.03 * math.sin(ph / dur * math.pi)
+        elif kind == "sleep":
+            rot = 9.0 * t
+            sy = 0.12 * t
+        elif kind == "bounce":
+            n = 4.0
+            oy = -abs(math.sin(ph / dur * math.pi * n)) * 22 * fade
+            sx = 0.08 * math.sin(ph / dur * math.pi * n * 2)
+            sy = -0.06 * math.sin(ph / dur * math.pi * n * 2)
+        elif kind == "shake":
+            rot = math.sin(ph * 38) * 5 * fade
+            sx = 0.06 * math.sin(ph * 30) * fade
+        elif kind == "angry":
+            rot = math.sin(ph * 16) * 12 * fade
+            oy = abs(math.sin(ph * 24)) * -5 * fade
+            sx = 0.05 * math.sin(ph * 20)
+        elif kind == "giggle":
+            rot = math.sin(ph * 28) * 5 * fade
+            oy = -abs(math.sin(ph * 18)) * 7 * fade
+        elif kind == "spin":
+            rot = (1.0 - t) * 360.0
+        elif kind == "tailslap":
+            rot = math.sin(ph * 22) * 18 * fade
+        elif kind == "puff":
+            s = 0.28 * math.sin(ph / dur * math.pi)
+            sx = s
+            sy = s
+        elif kind == "bubble":
+            rot = math.sin(ph * 5) * 4 * fade
+            oy = math.sin(ph * 3) * 3
+        elif kind == "eat":
+            chew = math.sin(ph * 14)
+            sx = 0.10 * chew
+            sy = -0.07 * chew
+        elif kind == "code":
+            rot = math.sin(ph * 6) * 3 * fade
+            oy = math.sin(ph * 8) * 2 * fade
+            sy = 0.04 * fade
+        elif kind == "study":
+            rot = math.sin(ph * 3) * 2 * fade
+            oy = math.sin(ph * 5) * 3 * fade
+        elif kind == "think":
+            rot = math.sin(ph * 2) * 6 * fade
+        return rot, sx, sy, oy
+
+    def _draw_action_extras(self, p, cx):
+        """动作附加绘制：Zzz / 🎈 / 泡泡 / 💻 / 📖"""
+        a = self.action
+        if not a or a not in ACTION_DEFS:
+            return
+        extra = ACTION_DEFS[a].get("extra")
+        if not extra:
+            return
+        top = BUBBLE_H + MARGIN
+        t = max(0.0, min(1.0, self.action_t))
+        if extra == "zzz":
+            zfont = QFont("Microsoft YaHei UI", 13)
+            zfont.setItalic(True)
+            zfont.setBold(True)
+            p.setFont(zfont)
+            p.setPen(QColor(110, 120, 160))
+            zphase = (self.t % 60) / 60.0
+            zy = top + self.cur_h * 0.15 - zphase * 16
+            p.drawText(int(cx + 26), int(zy), "Zzz…")
+        elif extra == "🎈":
+            size = int(18 + 16 * (1 - t))
+            p.setFont(QFont("Segoe UI Emoji", size))
+            p.setPen(Qt.PenStyle.NoPen)
+            by = top + self.cur_h * 0.06 - (1 - t) * 14
+            p.drawText(QRectF(cx - size, by, size * 2, size * 2),
+                       Qt.AlignmentFlag.AlignCenter, "🎈")
+        elif extra == "bubble":
+            p.setBrush(QColor(160, 200, 255, 150))
+            p.setPen(QColor(255, 255, 255, 200))
+            base_y = top + self.cur_h * 0.25
+            for i in range(4):
+                ph = (1 - t) * 2.5 + i * 0.3
+                r = 3.0 + i * 1.6
+                bx = cx + 22 + math.sin(ph * 3 + i) * 9
+                by = base_y - (ph % 1.3) * 26
+                p.drawEllipse(QPointF(bx, by), r, r)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(Qt.PenStyle.NoPen)
+        elif extra in ("💻", "📖"):
+            p.setFont(QFont("Segoe UI Emoji", 20))
+            p.setPen(Qt.PenStyle.NoPen)
+            fx = cx - self.cur_h * 0.42
+            fy = top + self.cur_h * 0.70
+            p.drawText(QRectF(fx - 13, fy - 13, 26, 26),
+                       Qt.AlignmentFlag.AlignCenter, extra)
+
+    # ---------- 碎碎念 ----------
+    def _whisper_tick(self):
+        if not self.cfg.get("whisper_enabled", True):
+            return
+        now = self.t * TICK
+        if now - self.last_whisper_tick < int(self.cfg.get("whisper_interval", 300)) * 1000:
+            return
+        self.last_whisper_tick = now
+        self._whisper_now()
+
+    def _whisper_now(self):
+        """碎碎念：说一句 + 做个小动作"""
+        if random.random() < 0.4:
+            self.say(random.choice(INNER_LINES), inner=True)
+        else:
+            self.say(random.choice(LINES))
+        if random.random() < 0.4:
+            self.play_action("思考碎碎念")
+
+    def _pomo_tick(self):
+        """番茄钟每秒倒计时 + 工作中随机学习动画"""
+        if self.pomo_state == "idle":
+            return
+        self.pomo_sec_elapsed += TICK / 1000.0
+        if self.pomo_sec_elapsed < 1.0:
+            return
+        self.pomo_sec_elapsed -= 1.0
+        self.pomo_remaining -= 1
+        if self.pomo_state == "work" and self.pomo_remaining > 0 and self.pomo_remaining % 45 == 0:
+            if random.random() < 0.5:
+                self.play_action(random.choice(["写代码", "背单词"]))
+            else:
+                self.say(f"🍅 还剩 {self.pomo_remaining // 60} 分 {self.pomo_remaining % 60} 秒～")
+        if self.pomo_remaining <= 0:
+            self._pomo_finish()
+
+    def _pomo_finish(self):
+        if self.pomo_state == "work":
+            self.pomo_state = "rest"
+            self.pomo_remaining = int(self.cfg.get("pomo_rest_min", 5)) * 60
+            self.pomo_sec_elapsed = 0.0
+            self._squash()
+            self.say(f"🍅 {self.pomo_task}时间到！休息一下吧～")
+            self._generate_nudge(self.pomo_task, "工作结束，该休息了")
+        else:
+            self.pomo_state = "idle"
+            self.pomo_remaining = 0
+            self.say("休息结束！要继续卷吗？")
+            self._generate_nudge(self.pomo_task, "休息结束，准备开始下一轮")
+
+    def _start_pomo_work(self):
+        task, ok = QInputDialog.getText(
+            self, "番茄钟", "这轮要做什么？（如：背单词）",
+            QLineEdit.EchoMode.Normal, self.pomo_task
+        )
+        if not ok or not task.strip():
+            return
+        self.pomo_task = task.strip()
+        self.pomo_state = "work"
+        self.pomo_remaining = int(self.cfg.get("pomo_work_min", 25)) * 60
+        self.pomo_sec_elapsed = 0.0
+        self._squash()
+        self.say(f"🍅 开始！{self.pomo_task}，{self.cfg.get('pomo_work_min', 25)}分钟走起～")
+        self._generate_nudge(self.pomo_task, "开始工作")
+
+    def _start_pomo_rest(self):
+        self.pomo_state = "rest"
+        self.pomo_remaining = int(self.cfg.get("pomo_rest_min", 5)) * 60
+        self.pomo_sec_elapsed = 0.0
+        self.say(f"🍅 休息{self.cfg.get('pomo_rest_min', 5)}分钟，鱼也陪你歇会儿～")
+        self._generate_nudge(self.pomo_task, "开始休息")
+
+    def _stop_pomo(self):
+        self.pomo_state = "idle"
+        self.pomo_remaining = 0
+        self.say("番茄钟停啦，想卷随时叫我～")
+
+    def _set_pomo_time(self):
+        work, ok1 = QInputDialog.getInt(
+            self, "番茄钟时长", "工作时长（分钟）:", int(self.cfg.get("pomo_work_min", 25)), 1, 180
+        )
+        if not ok1:
+            return
+        rest, ok2 = QInputDialog.getInt(
+            self, "番茄钟时长", "休息时长（分钟）:", int(self.cfg.get("pomo_rest_min", 5)), 1, 60
+        )
+        if not ok2:
+            return
+        self.cfg["pomo_work_min"] = work
+        self.cfg["pomo_rest_min"] = rest
+        self.say(f"番茄钟设为工作{work}分钟 / 休息{rest}分钟")
+
+    def _generate_nudge(self, task, kind):
+        """后台线程：让本地 Ollama 模型生成一句督促语"""
+
+        def worker():
+            try:
+                url = self.cfg.get("ollama_url", OLLAMA_URL).rstrip("/") + "/api/chat"
+                payload = {
+                    "model": self.cfg.get("ollama_model", OLLAMA_MODEL),
+                    "messages": [
+                        {"role": "system", "content": NUDGE_SYSTEM},
+                        {"role": "user", "content": f"我的任务：{task}；当前阶段：{kind}"}
+                    ],
+                    "stream": False,
+                    "options": {"temperature": 0.9, "num_predict": 80}
+                }
+                r = requests.post(url, json=payload, timeout=60)
+                if r.status_code == 200:
+                    text = r.json()["message"]["content"].strip().replace("\n", " ")
+                    if len(text) > 42:
+                        text = text[:40] + "…"
+                    self._queue_say(text)
+                else:
+                    self._queue_say(random.choice(POMO_FALLBACK))
+            except Exception:
+                self._queue_say(random.choice(POMO_FALLBACK))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _queue_say(self, text):
         """后台线程调用：只入队，由主线程 tick 统一弹出显示（线程安全）"""
@@ -763,6 +1201,12 @@ class PetWindow(QWidget):
             self.last_press_pos = e.globalPosition().toPoint()
             self.dragging = False
             self.drag_start_pos = e.globalPosition().toPoint()
+            self.drag_trail.clear()
+            self.drag_target = (self.x(), self.y())
+            self.thrown = False
+            self.vx = 0.0
+            self.vy = 0.0
+            self.action = None   # 按住时中断当前动作
             self.function_panel.hide()
             self.chat_dialog.hide()
             self.chat_paused = True
@@ -775,7 +1219,10 @@ class PetWindow(QWidget):
                 self.drag_offset = e.globalPosition().toPoint() - QPoint(self.x(), self.y())
             if self.dragging and self.drag_offset is not None:
                 pos = e.globalPosition().toPoint() - self.drag_offset
-                self.move(pos)
+                self.drag_target = (pos.x(), pos.y())   # 弹簧目标，实际位置由 tick 弹簧推进
+                self.drag_trail.append((time.time(), pos.x(), pos.y()))
+                if len(self.drag_trail) > 6:
+                    self.drag_trail.pop(0)
                 if abs(delta.x()) > 10:
                     self._set_dir("left" if delta.x() < 0 else "right", 1 if delta.x() < 0 else -1)
                 self.update()
@@ -786,6 +1233,12 @@ class PetWindow(QWidget):
                 self.dragging = False
                 self.drag_offset = None
                 self.drag_start_pos = None
+                # 甩抛物理：松手瞬间速度够大就飞出去
+                if self._throw_velocity():
+                    self.chat_paused = False
+                    self.last_press_pos = None
+                    self.drag_start_pos = None
+                    return
                 self._set_dir("down", 1)
                 self.target = None
                 self.rest_until = self.t * TICK + random.randint(6000, 14000)
@@ -800,14 +1253,15 @@ class PetWindow(QWidget):
     def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self._click_timer.stop()
-            self.food_panel.popup_at(self.x() + self.width() / 2, self.y() + BUBBLE_H)
+            # 双击：随机播放一个点击回应动作（dsh-pet 风格）
+            reacts = ["开心跃动", "害羞惊讶", "傲娇生气", "挠痒咯咯笑"]
+            self.play_action(random.choice(reacts))
 
     def _on_single_click(self):
-        """单击：蹦跳回嘴 + 弹聊天面板（两不误，不想聊点鱼身外关闭）"""
-        if random.random() < 0.7:
-            self.jump_t = 1.0
-        if random.random() < 0.6:
-            self.say(random.choice(REACT_LINES))
+        """单击：随机点击回应动作 + Q弹 + 弹聊天面板"""
+        reacts = ["开心跃动", "害羞惊讶", "傲娇生气", "挠痒咯咯笑"]
+        self.play_action(random.choice(reacts))
+        self._squash()
         panel = self.function_panel
         panel.popup_at(self.x() + self.width() / 2 - panel.width() / 2,
                        self.y() - panel.height() - 10)
@@ -815,14 +1269,16 @@ class PetWindow(QWidget):
     def on_food(self, food):
         self.food_panel.hide()
         self.eat_t = 1.0
+        self.eating = True
+        self.eat_food = food
         self.jump_t = 0.6
+        self._squash()
         lines = FOOD_LINES.get(food, ["好吃！"])
         self.say(random.choice(lines))
 
     def _show_chat_dialog(self):
-        key = self.cfg.get("ds_api_key", "")
-        if not key:
-            self.say("请先在右键菜单里设置 DeepSeek Key！")
+        if not self.cfg.get("ollama_model"):
+            self.say("请先在右键菜单的 AI 设置里配好模型！")
             self.chat_paused = False
             return
         self.chat_dialog.popup_at(
@@ -888,6 +1344,13 @@ class PetWindow(QWidget):
 
     def _build_menu(self):
         m = QMenu(self)
+        act_menu = m.addMenu("动作")
+        for cat, names in ACTION_CATEGORIES:
+            sub = act_menu.addMenu(cat)
+            for n in names:
+                sub.addAction(n, lambda checked=False, name=n: self.play_action(name))
+        m.addAction("碎碎念", self._whisper_now)
+        m.addSeparator()
         mode_menu = m.addMenu("模式")
         for label, key in [("自由散步", "wander"), ("跟随鼠标", "follow"), ("原地待着", "still")]:
             a = mode_menu.addAction(label)
@@ -900,7 +1363,14 @@ class PetWindow(QWidget):
             a.setCheckable(True)
             a.setChecked(abs(self.cur_h - 340 * mult) < 2)
             a.triggered.connect(lambda _, v=mult: self.set_size(v))
-        m.addAction("设置 Key", self._set_key_dialog)
+        ai_menu = m.addMenu("AI 设置")
+        ai_menu.addAction("设置本地模型", self._set_ollama_model)
+        ai_menu.addAction("设置 Ollama 地址", self._set_ollama_url)
+        pomo_menu = m.addMenu("番茄钟")
+        pomo_menu.addAction("开始学习（25分钟）", self._start_pomo_work)
+        pomo_menu.addAction("开始休息", self._start_pomo_rest)
+        pomo_menu.addAction("停止番茄钟", self._stop_pomo)
+        pomo_menu.addAction("设置时长", self._set_pomo_time)
         m.addAction("查看天气", self._get_weather)
         m.addSeparator()
         m.addAction("显示/隐藏", self.toggle_visible)
@@ -921,19 +1391,29 @@ class PetWindow(QWidget):
         m.addAction("退出", self.quit_app)
         return m
 
-    def _set_key_dialog(self):
-        key, ok = QInputDialog.getText(
-            self, 
-            "设置 DeepSeek Key", 
-            "输入你的 API Key（从 platform.deepseek.com 获取）:",
+    def _set_ollama_model(self):
+        model, ok = QInputDialog.getText(
+            self,
+            "设置本地模型",
+            "输入 Ollama 模型名（如 gemma3:4b / qwen2.5:3b）:",
             QLineEdit.EchoMode.Normal,
-            self.cfg.get("ds_api_key", "")
+            self.cfg.get("ollama_model", OLLAMA_MODEL)
         )
-        if ok and key.strip():
-            self.cfg["ds_api_key"] = key.strip()
-            self.say("Key 设置成功！")
-        elif ok and not key.strip():
-            self.say("Key 不能为空")
+        if ok and model.strip():
+            self.cfg["ollama_model"] = model.strip()
+            self.say(f"模型切换为 {model.strip()}")
+
+    def _set_ollama_url(self):
+        url, ok = QInputDialog.getText(
+            self,
+            "设置 Ollama 地址",
+            "输入 Ollama 服务地址（默认 http://localhost:11434）:",
+            QLineEdit.EchoMode.Normal,
+            self.cfg.get("ollama_url", OLLAMA_URL)
+        )
+        if ok and url.strip():
+            self.cfg["ollama_url"] = url.strip()
+            self.say("Ollama 地址已更新")
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Context:
