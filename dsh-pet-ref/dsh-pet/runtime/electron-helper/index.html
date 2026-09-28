@@ -133,6 +133,45 @@
       .pet-bub-tier-idle {
         color: #2e9e4f;
       }
+      /* 本地服务连接告警变体：暖色警示底 + 深红字，与普通白色气泡明显区分（连接失败必须可见） */
+      .pet-bubble.is-link-error {
+        background: rgba(255, 244, 240, 0.96);
+        color: #b3352a;
+        box-shadow: 0 4px 16px rgba(217, 79, 61, 0.28);
+      }
+      .pet-bubble.is-link-error::after {
+        border-top-color: rgba(255, 244, 240, 0.96);
+      }
+      /* 番茄钟剩余时间角标：常驻小胶囊，钉在宠物右上角。番茄钟的"持续可见性"由它承担——
+         工作状态气泡已改为限时收起，把气泡让给对话/碎碎念（见 events.js 的 renderBubble 优先级）。
+         不参与命中（pointer-events:none），尺寸随 var(--pet-size) 等比缩放，与气泡同一套字体 */
+      .pet-pomo {
+        position: absolute;
+        right: calc(var(--pet-size, 462px) * 0.04);
+        top: calc(var(--pet-size, 462px) * 0.05);
+        padding: calc(var(--pet-size, 462px) * 0.012) calc(var(--pet-size, 462px) * 0.028);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.94);
+        color: #b3352a;
+        font-family:
+          'ShangshouSoftCandy', 'Yuanti SC', 'YouYuan', '幼圆', 'Comic Sans MS', 'PingFang SC', 'Microsoft YaHei',
+          sans-serif;
+        font-size: calc(var(--pet-size, 462px) * 0.032);
+        line-height: 1.4;
+        white-space: nowrap;
+        z-index: 2;
+        pointer-events: none;
+        box-shadow: 0 calc(var(--pet-size, 462px) * 0.006) calc(var(--pet-size, 462px) * 0.02) rgba(0, 0, 0, 0.14);
+        opacity: 0;
+        transition: opacity 0.25s ease;
+      }
+      .pet-pomo.is-on {
+        opacity: 1;
+      }
+      /* 休息阶段换色（暖绿）：与专注阶段的暖红一眼可分 */
+      .pet-pomo.is-rest {
+        color: #2e9e4f;
+      }
       /* 配置错误提示（大声报错，不做静默兜底）：配置缺失/非法时显示，每 5s 自动重试 */
       .pet-error {
         position: fixed;

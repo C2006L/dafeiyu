@@ -30,9 +30,9 @@ contextBridge.exposeInMainWorld('petBridge', {
   setInputBusy(busy) {
     ipcRenderer.send('pet:input-busy', !!busy);
   },
-  // 右键菜单「打开网站」：主进程用系统默认浏览器打开 DSH 网站（等效网页 Ctrl+点击链接）
-  openDshSite(url) {
-    ipcRenderer.send('pet:open-site', { url });
+  // 右键菜单「服务控制台」：主进程用系统默认浏览器打开本地服务的控制台页面
+  openConsole(url) {
+    ipcRenderer.send('pet:open-console', { url });
   },
   // ---- 宠物间碰撞（跨窗 broker）----
   reportFlight(state) {

@@ -1316,7 +1316,8 @@ export function makePetUI(rt: {
     // ---- 右键菜单（统一自绘组件：树 + 渲染 + 样式与桌面共用 src/shared/menu.ts） ----
     // 注意：菜单是独立浮层，只在宠物命中区拦截右键（preventDefault + stopPropagation），
     // 绝不进入/改动 DSH 页面自己的菜单；浏览器端只有「碎碎念 / 回到初始位置 + 动作」——
-    // 无「打开网站 / 查看余额」（打开网站=就在网页里；查看余额已由对话框 /balance 命令实现）。
+    // 无「AI 设置 / 番茄钟 / 服务控制台 / 端口设置 / 查看余额」（这些都是桌面端专属；
+    // 查看余额已由对话框 /balance 命令实现）。
     const handleMenuAction = (leaf: MenuLeaf) => {
       if (leaf.action === 'whisper') {
         // 手动碎碎念：强制 host 立即新生成一句并展示（绕过节流缓存；失败显式告警，不伪造文案）。

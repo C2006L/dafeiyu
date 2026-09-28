@@ -732,10 +732,10 @@ app.whenReady().then(() => {
     inputBusy.set(win.id, !!busy);
   });
 
-  // 右键菜单「打开网站」：交给**系统默认浏览器**打开（等效于网页里 Ctrl+点击链接新标签页），
+  // 右键菜单「服务控制台」：交给**系统默认浏览器**打开服务页面（等效于网页里 Ctrl+点击链接），
   // 不建专属窗口——宠物窗口机制是透明小窗，不该承载常规网页浏览。URL 由渲染端从
-  // configUrl 推导 = DSH webServer 端口，端口变化自动跟随
-  ipcMain.on('pet:open-site', (event, payload) => {
+  // configUrl 推导（本地部署 = pet-server 端口，端口变化自动跟随）
+  ipcMain.on('pet:open-console', (event, payload) => {
     const url = payload && typeof payload === 'object' ? String(payload.url || '') : '';
     if (!/^https?:[/][/]/.test(url)) return;
     shell.openExternal(url).catch((error) => {

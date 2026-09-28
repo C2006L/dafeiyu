@@ -7,7 +7,8 @@
 // 菜单数据单一事实来源 = 合并后的 animations 配置（用户覆盖层自动生效）。
 //
 // 菜单层级（与产品定义一致）：
-//   一级 = 工具项 + 动作：打开网站 / 查看余额（桌面端专属）与 回到初始位置（两端共用），由各壳注入；
+//   一级 = 工具项 + 动作：AI 设置 / 番茄钟 / 服务控制台 / 端口设置 / 查看余额（桌面端专属）
+//          与 回到初始位置（两端共用），由各壳注入；
 //   二级（动作的子级）= 分类：待机 / 转向 / 拖拽 / 点击回应 / 移动 / config 随机动作分类 / 事件档位
 //   三级 = 具体动画名
 //
@@ -29,9 +30,21 @@ export interface MenuLeaf {
   label: string;
   /** 播放的动画名（点播动作）；action 优先于 anim */
   anim?: string;
-  /** 自定义动作：open-site=打开网站 / show-balance=查看余额；whisper=立即碎碎念一句；
-   * chat=打开对话弹窗；home=回到初始位置。手动触发均不受 whisperEnabled 影响（该字段只关自动周期轮询） */
-  action?: 'open-site' | 'show-balance' | 'whisper' | 'chat' | 'home';
+  /** 自定义动作：ai-settings=切换 Ollama 模型 / open-console=打开本地服务控制台 /
+   * port-config=端口设置 / pomo-start|pomo-stop|pomo-config=番茄钟 / show-balance=查看余额；
+   * whisper=立即碎碎念一句；chat=打开对话弹窗；home=回到初始位置。
+   * 除 show-balance/home 外均为桌面端专属；手动触发均不受 whisperEnabled 影响（该字段只关自动周期轮询） */
+  action?:
+    | 'ai-settings'
+    | 'open-console'
+    | 'port-config'
+    | 'pomo-start'
+    | 'pomo-stop'
+    | 'pomo-config'
+    | 'show-balance'
+    | 'whisper'
+    | 'chat'
+    | 'home';
 }
 
 /** 分支：带子菜单的项 */

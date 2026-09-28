@@ -22,6 +22,15 @@ import { createReadStream, existsSync, readFileSync, writeFileSync, mkdirSync, s
 import { join, resolve, normalize, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// ---------- 进程级兜底（服务必须常驻：崩溃即"桌宠失联"，客户端只能靠探测发现） ----------
+// 单个请求/定时器里的未捕获异常此前会直接带走整个进程，用户侧表现为"桌宠开着但所有功能没反应"。
+process.on('uncaughtException', (e) => {
+  console.error('[pet-server] 未捕获异常（进程继续运行）：', e);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('[pet-server] 未处理的 Promise 拒绝（进程继续运行）：', e);
+});
+
 // ---------- 路径 ----------
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(HERE, '..');
@@ -34,8 +43,20 @@ const POMO_FILE = join(PACKAGE_ROOT, 'assets', 'pomo.json');
 const DATA_DIR = process.env.PET_DATA_DIR || join(PACKAGE_ROOT, '.data');
 const MEMORY_FILE = join(DATA_DIR, 'memory.json');
 const AI_CFG_FILE = join(DATA_DIR, 'ai.json');
+const SERVER_CFG_FILE = join(DATA_DIR, 'server.json');
 
-const PORT = Number(process.argv[2] || process.env.PET_PORT || 8231);
+// 端口优先级：命令行参数 > 环境变量 PET_PORT > .data/server.json（右键「端口设置」写入）> 8231
+function readConfiguredPort() {
+  try {
+    const n = Number(JSON.parse(readFileSync(SERVER_CFG_FILE, 'utf8')).port);
+    if (Number.isInteger(n) && n > 0 && n < 65536) return n;
+  } catch {
+    /* 未配置：交给下一级默认值 */
+  }
+  return 0;
+}
+
+const PORT = Number(process.argv[2] || process.env.PET_PORT || 0) || readConfiguredPort() || 8231;
 const PREFIX = '/dsh-pet-7340';
 const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://localhost:11434').replace(/\/$/, '');
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
@@ -270,6 +291,255 @@ function safeResolve(root, rel) {
   return candidate;
 }
 
+/**
+ * 服务控制台页面（右键「服务控制台」用系统浏览器打开）。
+ * 此前这里只是一张只读信息页，用户点开看不到能做什么 —— 故升级为**可操作**的控制台：
+ * 状态只读 + 番茄钟 / AI 模型 / 服务端口可直接操作，与桌宠右键菜单同源同一批 API。
+ * 视觉：日本简约（Japandi）+ Kawaii 微调 —— 暖纸底、圆角胶囊、单一暖陶土色点缀，无表情化角色。
+ */
+function consolePage() {
+  return `<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>大肥鱼桌宠 · 服务控制台</title>
+<style>
+:root{--bg:#f7f3ee;--card:#fffdfa;--ink:#4a4038;--muted:#9c9086;--line:#eae1d7;--accent:#c98b6b;--accent-soft:#f6ece4;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);line-height:1.7;
+  font-family:"Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:760px;margin:0 auto;padding:36px 20px 60px}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+.brand{font-size:22px;font-weight:700;letter-spacing:.5px}
+.brand .sub{display:block;font-size:12px;font-weight:400;color:var(--muted);letter-spacing:2px;margin-top:2px}
+.dot{font-size:13px;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 14px}
+.dot.ok{color:#6f8f6a}
+.dot.bad{color:#b3352a}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:20px 22px;margin-bottom:16px;
+  box-shadow:0 6px 20px rgba(140,120,100,.07)}
+.card h2{margin:0 0 12px;font-size:15px;font-weight:700;letter-spacing:1px}
+.card h2::before{content:"";display:inline-block;width:8px;height:8px;border-radius:999px;background:var(--accent);
+  margin-right:8px;vertical-align:1px}
+.rows{display:grid;gap:8px}
+.row{display:flex;justify-content:space-between;gap:12px;font-size:13px;border-bottom:1px dashed var(--line);padding-bottom:8px}
+.row:last-child{border-bottom:none;padding-bottom:0}
+.row span{color:var(--muted);flex:none}
+.row b{font-weight:600;text-align:right;word-break:break-all}
+.hint{margin:0 0 12px;font-size:12px;color:var(--muted)}
+label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--muted)}
+input,select{font:inherit;font-size:14px;color:var(--ink);background:#fff;border:1px solid var(--line);
+  border-radius:12px;padding:9px 12px;outline:none;transition:border-color .2s}
+input:focus,select:focus{border-color:var(--accent)}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+.actions{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;align-items:center}
+.grow{flex:1;min-width:160px}
+.btn{font:inherit;font-size:13px;border-radius:999px;padding:9px 20px;border:1px solid var(--line);background:#fff;
+  color:var(--ink);cursor:pointer;transition:border-color .2s,color .2s,filter .2s}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{filter:brightness(.95);color:#fff}
+.btn.ghost{background:var(--accent-soft);border-color:transparent;color:var(--accent)}
+.msg{margin:10px 0 0;font-size:12.5px;min-height:18px;color:var(--muted)}
+.msg.ok{color:#6f8f6a}
+.msg.warn{color:#b3352a}
+footer{margin-top:24px;font-size:12px;color:var(--muted);text-align:center}
+</style></head><body>
+<div class="wrap">
+  <header>
+    <div class="brand">大肥鱼桌宠<span class="sub">本地服务控制台</span></div>
+    <div id="dot" class="dot">连接中…</div>
+  </header>
+
+  <section class="card">
+    <h2>运行状态</h2>
+    <div class="rows">
+      <div class="row"><span>服务地址</span><b id="s-addr">—</b></div>
+      <div class="row"><span>服务端口</span><b id="s-port">—</b></div>
+      <div class="row"><span>已运行</span><b id="s-uptime">—</b></div>
+      <div class="row"><span>Ollama 地址</span><b id="s-ollama">—</b></div>
+      <div class="row"><span>当前模型</span><b id="s-model">—</b></div>
+      <div class="row"><span>番茄钟</span><b id="s-pomo">—</b></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>番茄钟</h2>
+    <p class="hint">开始后桌宠头顶会出现剩余时间角标；专注结束自动进入休息，休息结束回到下一轮专注。</p>
+    <div class="grid3">
+      <label>任务名<input id="p-task" type="text" placeholder="专注"></label>
+      <label>专注（分钟）<input id="p-work" type="number" min="1" max="600" placeholder="25"></label>
+      <label>休息（分钟）<input id="p-rest" type="number" min="1" max="600" placeholder="5"></label>
+    </div>
+    <div class="actions">
+      <button id="p-start" class="btn primary">开始专注</button>
+      <button id="p-stop" class="btn">停止</button>
+      <button id="p-save" class="btn ghost">保存设置</button>
+    </div>
+    <p class="msg" id="p-msg"></p>
+  </section>
+
+  <section class="card">
+    <h2>AI 模型</h2>
+    <p class="hint">列表来自本机 Ollama，切换后立即生效（下一句对话即用新模型）。</p>
+    <div class="actions">
+      <select id="m-select" class="grow"></select>
+      <button id="m-reload" class="btn ghost">刷新列表</button>
+    </div>
+    <div class="actions">
+      <input id="m-input" type="text" class="grow" placeholder="模型名，如 qwen2.5:3b">
+      <button id="m-save" class="btn primary">切换</button>
+    </div>
+    <p class="msg" id="m-msg"></p>
+  </section>
+
+  <section class="card">
+    <h2>服务端口</h2>
+    <p class="hint">写入 .data/server.json，重启桌宠后生效（端口被占用时启动器会给出日志提示）。</p>
+    <div class="actions">
+      <input id="o-port" type="number" min="1" max="65535" class="grow">
+      <button id="o-save" class="btn primary">保存</button>
+    </div>
+    <p class="msg" id="o-msg"></p>
+  </section>
+
+  <footer>右键桌宠可快速操作：AI 设置 / 番茄钟 / 端口设置 / 对话</footer>
+</div>
+<script>
+var PREFIX = '/dsh-pet-7340';
+function $(id){ return document.getElementById(id); }
+function get(path){ return fetch(PREFIX + path, {cache:'no-store'}).then(function(r){ return r.json(); }); }
+function post(path, body){
+  return fetch(PREFIX + path, {method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify(body || {}), cache:'no-store'}).then(function(r){ return r.json(); });
+}
+function say(el, text, ok){
+  el.textContent = text || '';
+  el.className = 'msg' + (text ? (ok ? ' ok' : ' warn') : '');
+}
+function fmtUptime(ms){
+  var s = Math.floor((ms || 0) / 1000);
+  return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分 ' + (s % 60) + ' 秒';
+}
+function fmtRemain(ms){
+  var s = Math.max(0, Math.ceil((ms || 0) / 1000));
+  return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2);
+}
+function applyStatus(d){
+  var dot = $('dot');
+  dot.textContent = '● 服务正常';
+  dot.className = 'dot ok';
+  $('s-addr').textContent = location.origin + PREFIX;
+  $('s-port').textContent = d.port;
+  $('s-uptime').textContent = fmtUptime(d.uptimeMs);
+  $('s-ollama').textContent = d.ollamaUrl || '—';
+  $('s-model').textContent = d.model || '—';
+  var p = d.pomo || {};
+  $('s-pomo').textContent = p.state === 'work' ? ('专注中 · ' + (p.task || '') + ' · 剩余 ' + fmtRemain(p.remainMs))
+    : p.state === 'rest' ? ('休息中 · 剩余 ' + fmtRemain(p.remainMs)) : '空闲';
+  if (document.activeElement !== $('o-port')) $('o-port').value = d.port || '';
+  if (document.activeElement !== $('p-task')) $('p-task').value = p.task || '';
+}
+function tick(){
+  get('/health').then(applyStatus).catch(function(){
+    var dot = $('dot');
+    dot.textContent = '● 连不上本地服务';
+    dot.className = 'dot bad';
+  });
+}
+function loadPomoCfg(){
+  get('/pomo/config').then(function(d){
+    if (d && d.ok && d.config){
+      $('p-task').value = d.config.task || '';
+      $('p-work').value = d.config.workMin || 25;
+      $('p-rest').value = d.config.restMin || 5;
+    }
+  });
+}
+function loadModels(auto){
+  if (!auto) say($('m-msg'), '正在读取模型列表…');
+  get('/ai/models').then(function(d){
+    var sel = $('m-select');
+    sel.innerHTML = '';
+    if (d && d.ok && d.models && d.models.length){
+      for (var i = 0; i < d.models.length; i++){
+        var o = document.createElement('option');
+        o.value = d.models[i];
+        o.textContent = d.models[i];
+        if (d.models[i] === d.current) o.selected = true;
+        sel.appendChild(o);
+      }
+      sel.disabled = false;
+      $('m-input').value = d.current || sel.value;
+      say($('m-msg'), '共 ' + d.models.length + ' 个已安装模型', true);
+    } else {
+      var o2 = document.createElement('option');
+      o2.value = '';
+      o2.textContent = '（拿不到列表）';
+      sel.appendChild(o2);
+      sel.disabled = true;
+      $('m-input').value = (d && d.current) || '';
+      say($('m-msg'), '⚠ ' + ((d && d.message) || '拿不到模型列表') +
+        '。请确认已运行 ollama serve；仍可在下方手动输入模型名切换。');
+    }
+  }).catch(function(e){ say($('m-msg'), '⚠ 读取失败：' + e.message); });
+}
+$('p-start').onclick = function(){
+  post('/pomo/start', {
+    task: $('p-task').value.trim() || undefined,
+    workMin: Number($('p-work').value) || undefined,
+    restMin: Number($('p-rest').value) || undefined
+  }).then(function(d){
+    say($('p-msg'), d && d.ok ? ('已开始专注：' + (d.task || '')) : ('失败：' + ((d && d.message) || '未知错误')), !!(d && d.ok));
+    tick();
+  }).catch(function(e){ say($('p-msg'), '失败：' + e.message); });
+};
+$('p-stop').onclick = function(){
+  post('/pomo/stop').then(function(d){
+    say($('p-msg'), d && d.ok ? '番茄钟已停止' : ('失败：' + ((d && d.message) || '未知错误')), !!(d && d.ok));
+    tick();
+  }).catch(function(e){ say($('p-msg'), '失败：' + e.message); });
+};
+$('p-save').onclick = function(){
+  post('/pomo/config', {
+    task: $('p-task').value.trim() || '专注',
+    workMin: Number($('p-work').value) || 25,
+    restMin: Number($('p-rest').value) || 5
+  }).then(function(d){
+    say($('p-msg'), d && d.ok ? '设置已保存（下次开始生效）' : ('失败：' + ((d && d.message) || '未知错误')), !!(d && d.ok));
+  }).catch(function(e){ say($('p-msg'), '失败：' + e.message); });
+};
+$('m-select').onchange = function(){ $('m-input').value = $('m-select').value; };
+$('m-reload').onclick = function(){ loadModels(false); };
+$('m-save').onclick = function(){
+  var model = $('m-input').value.trim();
+  if (!model){ say($('m-msg'), '请先选择或输入模型名'); return; }
+  post('/ai/config', {model: model}).then(function(d){
+    if (d && d.ok){
+      say($('m-msg'), '模型已切换为 ' + d.model, true);
+      tick();
+      loadModels(true);
+    } else {
+      say($('m-msg'), '切换失败：' + ((d && d.message) || '未知错误'));
+    }
+  }).catch(function(e){ say($('m-msg'), '切换失败：' + e.message); });
+};
+$('o-save').onclick = function(){
+  var port = Number($('o-port').value);
+  if (!(port >= 1 && port <= 65535)){ say($('o-msg'), '端口必须是 1-65535 之间的整数'); return; }
+  post('/server/port', {port: port}).then(function(d){
+    if (d && d.ok){
+      say($('o-msg'), d.restartRequired ? ('已保存为 ' + port + '，重启桌宠后生效') : ('端口已是 ' + port + '，无需改动'), true);
+    } else {
+      say($('o-msg'), '保存失败：' + ((d && d.message) || '未知错误'));
+    }
+  }).catch(function(e){ say($('o-msg'), '保存失败：' + e.message); });
+};
+tick();
+loadPomoCfg();
+loadModels(true);
+setInterval(tick, 2000);
+</script>
+</body></html>`;
+}
+
 // ---------- 路由 ----------
 const sendJson = (res, status, body) => {
   const payload = JSON.stringify(body);
@@ -308,7 +578,62 @@ async function handleRoute(url, method, bodyText) {
     return { json: { ok: true } };
   }
   if (pathname === PREFIX + '/pomo/status') {
-    return { json: { ok: true, state: pomo.state, task: pomo.task } };
+    const cfg = getPomoCfg();
+    const running = pomo.state === 'work' || pomo.state === 'rest';
+    return {
+      json: {
+        ok: true,
+        state: pomo.state,
+        task: pomo.task,
+        endsAt: pomo.endsAt,
+        remainMs: running ? Math.max(0, pomo.endsAt - Date.now()) : 0,
+        enabled: cfg.enabled === true,
+        workMin: cfg.workMin || 25,
+        restMin: cfg.restMin || 5,
+      },
+    };
+  }
+  // 番茄钟配置（右键「番茄钟 → 设置时长」写入 assets/pomo.json）
+  // 注意：enabled 只决定下次启动是否自动开始，不影响当前这一轮
+  if (pathname === PREFIX + '/pomo/config') {
+    if (method === 'POST') {
+      try {
+        const body = JSON.parse(bodyText || '{}');
+        const cfg = getPomoCfg();
+        if (typeof body.task === 'string' && body.task.trim()) cfg.task = body.task.trim();
+        for (const k of ['workMin', 'restMin']) {
+          const n = Number(body[k]);
+          if (Number.isFinite(n) && n > 0 && n <= 600) cfg[k] = Math.round(n);
+        }
+        if (typeof body.enabled === 'boolean') cfg.enabled = body.enabled;
+        writeFileSync(POMO_FILE, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+        console.log('[pet-server] 番茄钟配置更新: ' + JSON.stringify(cfg));
+        return { json: { ok: true, config: cfg } };
+      } catch (e) {
+        return { json: { ok: false, message: String(e.message || e) } };
+      }
+    }
+    return { json: { ok: true, config: getPomoCfg() } };
+  }
+
+  // 健康检查：客户端 3s 探测一次，连续失败即在气泡上告警（连接失败必须可见，不再静默）
+  if (pathname === PREFIX + '/health') {
+    const running = pomo.state === 'work' || pomo.state === 'rest';
+    return {
+      json: {
+        ok: true,
+        port: PORT,
+        uptimeMs: Math.round(process.uptime() * 1000),
+        model: aiCfg.model,
+        ollamaUrl: aiCfg.url,
+        pomo: {
+          enabled: getPomoCfg().enabled === true,
+          state: pomo.state,
+          task: pomo.task,
+          remainMs: running ? Math.max(0, pomo.endsAt - Date.now()) : 0,
+        },
+      },
+    };
   }
 
   // AI 配置（右键「AI 设置」换模型用）
@@ -326,6 +651,52 @@ async function handleRoute(url, method, bodyText) {
       }
     }
     return { json: { ok: true, model: aiCfg.model, url: aiCfg.url } };
+  }
+
+  // 已安装模型列表（右键「AI 设置」下拉用）：代理 Ollama GET /api/tags。
+  // Ollama 不可达时返回 ok:false + 中文原因（弹窗据此提示"Ollama 没起来"），绝不伪造空列表——
+  // 空列表会让用户以为"本地没有模型"，而真正的原因是服务没启动。
+  if (pathname === PREFIX + '/ai/models') {
+    try {
+      const res = await fetch(aiCfg.url + '/api/tags', { signal: AbortSignal.timeout(4000) });
+      if (!res.ok) {
+        return { json: { ok: false, current: aiCfg.model, message: 'Ollama HTTP ' + res.status } };
+      }
+      const data = await res.json();
+      const models = (Array.isArray(data.models) ? data.models : [])
+        .map((m) => (m && typeof m.name === 'string' ? m.name : ''))
+        .filter(Boolean);
+      return { json: { ok: true, current: aiCfg.model, url: aiCfg.url, models } };
+    } catch (e) {
+      return {
+        json: {
+          ok: false,
+          current: aiCfg.model,
+          url: aiCfg.url,
+          message: '连不上 Ollama（' + aiCfg.url + '）：' + (e && e.message ? e.message : String(e)),
+        },
+      };
+    }
+  }
+
+  // 服务端口：GET 读当前生效端口 + 配置文件里的端口；POST 写入 .data/server.json（**重启后生效**）。
+  // 端口是进程启动参数，运行期无法热改——POST 只落盘，返回 restartRequired 让客户端如实告知用户。
+  if (pathname === PREFIX + '/server/port') {
+    if (method === 'POST') {
+      try {
+        const body = JSON.parse(bodyText || '{}');
+        const n = Number(body.port);
+        if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+          return { json: { ok: false, message: '端口必须是 1-65535 之间的整数' } };
+        }
+        writeFileSync(SERVER_CFG_FILE, JSON.stringify({ port: n }, null, 2), 'utf8');
+        console.log('[pet-server] 端口配置已写入 ' + SERVER_CFG_FILE + '：' + n + '（重启后生效）');
+        return { json: { ok: true, port: PORT, configured: n, restartRequired: n !== PORT } };
+      } catch (e) {
+        return { json: { ok: false, message: String(e.message || e) } };
+      }
+    }
+    return { json: { ok: true, port: PORT, configured: readConfiguredPort() || PORT } };
   }
 
   // 碎碎念
@@ -438,24 +809,9 @@ async function handleRoute(url, method, bodyText) {
     return { file, contentType: type };
   }
 
-  // 根路径：右键「打开网站」用系统浏览器打开的信息页
+  // 根路径：右键「服务控制台」用系统浏览器打开（可操作番茄钟 / 模型 / 端口，见 consolePage）
   if (pathname === '/' || pathname === '/index.html') {
-    const p = pomo.state === 'work' ? '🍅 学习中（' + pomo.task + '）' : pomo.state === 'rest' ? '🍵 休息中' : '⏳ 空闲';
-    return {
-      html:
-        '<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>大肥鱼桌宠服务</title>' +
-        '<style>body{font-family:system-ui,"Microsoft YaHei",sans-serif;background:#f4f6fb;color:#2b2b2b;' +
-        'margin:0;padding:40px;max-width:720px;margin:auto}h1{color:#5686fe}p{line-height:1.8}.card{' +
-        'background:#fff;border-radius:14px;padding:20px 24px;margin:16px 0;box-shadow:0 6px 20px rgba(0,0,0,.06)}' +
-        'code{background:#eef1f8;padding:2px 8px;border-radius:6px;font-size:.92em}</style></head><body>' +
-        '<h1>🐋 大肥鱼桌宠 · 本地服务</h1>' +
-        '<div class="card"><p><b>运行状态：</b>✅ 正常</p><p><b>番茄钟：</b>' + p + '</p></div>' +
-        '<div class="card"><p><b>AI 模型：</b><code>' + aiCfg.model + '</code></p>' +
-        '<p><b>Ollama 地址：</b><code>' + aiCfg.url + '</code></p></div>' +
-        '<div class="card"><p>桌宠本体在桌面上运行（Electron 透明窗），这里是它的配套服务：负责本地 AI 对话、' +
-        '碎碎念、番茄钟督促和动画素材。右键桌宠菜单可随时「AI 设置」切换模型。</p></div>' +
-        '</body></html>',
-    };
+    return { html: consolePage() };
   }
 
   return { text: `pet-server: not found ${pathname}`, status: 404 };
@@ -488,6 +844,17 @@ const server = createServer(async (req, res) => {
     console.error('[pet-server] route error:', e);
     res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' }).end('pet-server error: ' + String(e.message || e));
   }
+});
+
+// 启动失败要让启动器与用户看得懂：端口被占是最常见的一种
+server.on('error', (e) => {
+  if (e && e.code === 'EADDRINUSE') {
+    console.error(`[pet-server] 端口 ${PORT} 已被占用（可能已有一个 pet-server 在运行，或该端口被其它程序占用）。`);
+    console.error('[pet-server] 处理：关闭占用该端口的程序，或在右键菜单「端口设置」中改用其它端口后重启。');
+  } else {
+    console.error('[pet-server] 服务器错误：', e);
+  }
+  process.exit(1);
 });
 
 server.listen(PORT, '127.0.0.1', () => {

@@ -7,8 +7,9 @@
 'use strict';
 
 // ---- 工作状态联动（DSH 会话状态，每只宠物按 workStatusEnabled 门控；容器 1s 轮询，ts 变化才递增 tick）----
-// 气泡驻留语义与浏览器一致：thinking/working/result/waiting（"事情还没完"）常驻直到状态切走；
-//   success/error（"这事结束了"）10s 自动收起；state=null（空闲/回合被打断）收起气泡回待机。
+// 气泡驻留语义：thinking/working/result/waiting（"事情还没完"）限时展示 WORK_BUBBLE_DURATION_MS 后自动收起
+//   （不常驻——常驻会永久占住气泡，对话/碎碎念没有出场机会）；success/error（"这事结束了"）10s 自动收起；
+//   state=null（空闲/回合被打断）立即收起气泡回待机。瞬时消息（碎碎念/对话）可随时插播压过工作气泡。
 // 动画循环语义：进行中档位循环播（switchTo once=false），终态档位播一遍回 idle 链；
 //   回空闲时把正在循环的那段改成"播完即停"（见下面空闲分支），否则 ended 永不触发、链回不去。
 PetSprite.prototype.onWorkTick = function onWorkTick(snapshot, tick) {
@@ -80,12 +81,16 @@ PetSprite.prototype.onWorkTick = function onWorkTick(snapshot, tick) {
   if (stateChanged) {
     this.workOn = true;
     if (this.workTimer !== null) window.clearTimeout(this.workTimer);
-    this.workTimer = terminal
-      ? window.setTimeout(() => {
-          this.workOn = false;
-          this.renderBubble();
-        }, BUBBLE_DURATION_MS)
-      : null; // 非终态：常驻，不设自动收起
+    // 终态（"这事结束了"）10s 收起；非终态（"事情还没完"）改为**限时展示**——此前常驻会把气泡
+    // 永久占住，对话/碎碎念/切换提示永远没有出场机会（"气泡永远是背单词"的根因之一）。
+    // 番茄钟运行期间的持续可见性由「剩余时间角标」承担，不再依赖常驻气泡。
+    this.workTimer = window.setTimeout(
+      () => {
+        this.workOn = false;
+        this.renderBubble();
+      },
+      terminal ? BUBBLE_DURATION_MS : WORK_BUBBLE_DURATION_MS,
+    );
   }
   this.renderBubble();
   // 循环语义（与浏览器 setOnce 一致）：终态播一遍回 idle；非终态多候选档位播一遍 →
@@ -258,6 +263,99 @@ PetSprite.prototype.showBalanceNow = function showBalanceNow(state) {
   this.playOnce(name);
 };
 
+// ---- 本地服务连通性（3s 探测 /health）----
+// 与业务轮询解耦、不受任何功能开关门控：服务挂掉这件事必须在任何配置下都可见。
+// 此前 whisper/broadcast/work-status 的失败全部静默 catch，用户只能看到"桌宠开着但所有功能没反应"。
+PetSprite.prototype.noteLinkResult = function noteLinkResult(ok) {
+  window.__dshPetDebug.linkFailures = ok ? 0 : this.linkFailures;
+  if (ok) {
+    this.linkFailures = 0;
+    if (this.linkDown) {
+      this.linkDown = false;
+      window.__dshPetDebug.linkDown = false;
+      console.log('[dsh-pet] 本地服务已恢复：' + ORIGIN);
+      this.renderBubble();
+    }
+    return;
+  }
+  this.linkFailures += 1;
+  if (!this.linkDown && this.linkFailures >= LINK_FAIL_THRESHOLD) {
+    this.linkDown = true;
+    window.__dshPetDebug.linkDown = true;
+    console.error('[dsh-pet] 本地服务不可达（连续 ' + this.linkFailures + ' 次探测失败）：' + ORIGIN);
+    this.renderBubble();
+  }
+};
+
+PetSprite.prototype.startLinkLoop = function startLinkLoop() {
+  if (this.linkLoopTimer !== null) return;
+  console.log('[dsh-pet] 连通性探测已启动 pet=' + this.pet.id + '（每 ' + LINK_PROBE_INTERVAL_MS + 'ms 探测 /health）');
+  const probe = async () => {
+    try {
+      const res = await fetch(BASE + '/health', { cache: 'no-store', signal: AbortSignal.timeout(2500) });
+      this.noteLinkResult(res.ok);
+    } catch {
+      this.noteLinkResult(false);
+    }
+  };
+  this.linkLoopTimer = window.setInterval(() => void probe(), LINK_PROBE_INTERVAL_MS);
+  void probe();
+};
+
+// ---- 番茄钟剩余时间角标 ----
+// 真值只在服务端（/pomo/status 给 state/endsAt）：渲染端只做本地秒级递减，定期与服务端对齐，
+// 避免两端各跑一份倒计时互相跑偏。角标是与气泡并列的独立元素，因此番茄钟运行**不占**气泡。
+PetSprite.prototype.renderPomoBadge = function renderPomoBadge() {
+  const el = this.pomoEl;
+  if (!el) return;
+  if (!this.pomoRunning || !this.pomoEndsAt) {
+    el.classList.remove('is-on', 'is-rest');
+    el.textContent = '';
+    window.__dshPetDebug.pomoBadge = '';
+    return;
+  }
+  const remainSec = Math.max(0, Math.ceil((this.pomoEndsAt - Date.now()) / 1000));
+  const mm = String(Math.floor(remainSec / 60)).padStart(2, '0');
+  const ss = String(remainSec % 60).padStart(2, '0');
+  const rest = this.pomoPhase === 'rest';
+  el.textContent = (rest ? '休息 ' : '专注 ') + mm + ':' + ss + (rest ? '' : ' · ' + (this.pomoTask || ''));
+  el.classList.toggle('is-rest', rest);
+  el.classList.add('is-on');
+  window.__dshPetDebug.pomoBadge = el.textContent;
+};
+
+// 与服务端对齐番茄钟状态。失败静默：连接性问题已由连通性探测统一告警（startLinkLoop），
+// 这里再弹一次只会和那条告警抢气泡。
+PetSprite.prototype.syncPomo = async function syncPomo() {
+  try {
+    const res = await fetch(BASE + '/pomo/status', { cache: 'no-store', signal: AbortSignal.timeout(2500) });
+    if (!res.ok) return;
+    const d = (await res.json().catch(() => null)) || {};
+    const running = d.state === 'work' || d.state === 'rest';
+    this.pomoRunning = running;
+    this.pomoPhase = running ? d.state : 'idle';
+    this.pomoTask = typeof d.task === 'string' ? d.task : '';
+    this.pomoEndsAt = running && typeof d.endsAt === 'number' ? d.endsAt : 0;
+    this.renderPomoBadge();
+  } catch {
+    /* 静默：连通性探测负责发现与告警 */
+  }
+};
+
+// 角标 1s 刷新：奇数 tick 与服务端对齐，偶数 tick 只做本地递减（省掉每秒一次请求）；
+// 倒计时到点（工作→休息、休息→空闲的切换由服务端裁决）额外立即对齐一次。
+PetSprite.prototype.startPomoLoop = function startPomoLoop() {
+  if (this.pomoLoopTimer !== null) return;
+  let n = 0;
+  this.pomoLoopTimer = window.setInterval(() => {
+    n += 1;
+    const due = this.pomoRunning && this.pomoEndsAt > 0 && this.pomoEndsAt - Date.now() <= 0;
+    if (n % 2 === 1 || due) void this.syncPomo();
+    else this.renderPomoBadge();
+  }, 1000);
+  void this.syncPomo();
+};
+
 // ---------- 轮询组装（容器统一拉取/触发，与浏览器 PetMulti 同一套路径；boot 成功后调用） ----------
 
 // 余额不可用 → 文字说明气泡（周期轮询与手动 /balance 触发共用这一条路径；判定在 shared，与浏览器同一份）：
@@ -276,6 +374,12 @@ function applyBalanceNotice(state, explicit) {
 function startLoops() {
   if (loopsStarted) return;
   loopsStarted = true;
+
+  // 连通性探测：无条件启动（不依赖任何功能开关），保证"服务挂了"永远可见
+  for (const s of sprites) s.startLinkLoop();
+
+  // 番茄钟角标：同样无条件启动（番茄钟是否在跑由服务端 /pomo/status 决定，与任何前端开关无关）
+  for (const s of sprites) s.startPomoLoop();
 
   // 是否存在启用余额功能的宠物：全禁用时跳过余额轮询（不拉取，避免无意义的周期请求——与浏览器一致）
   const anyBalanceEnabled = sprites.some((s) => s.pet.balanceEnabled);

@@ -13,7 +13,9 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "PET_DIR=%ROOT%\dsh-pet-ref\dsh-pet"
 set "DSH_HOME=%ROOT%\dsh-home"
-set "PET_PORT=8231"
+rem ── 服务端口：.data\server.json 优先（右键菜单「端口设置」写入），否则默认 8231 ──
+for /f "usebackq delims=" %%p in (`powershell -NoProfile -Command "$v=8231;try{$j=ConvertFrom-Json -InputObject (Get-Content -Raw -LiteralPath '%PET_DIR%\.data\server.json' -ErrorAction Stop);$n=[int]$j.port;if($n -gt 0 -and $n -lt 65536){$v=$n}}catch{};Write-Output $v"`) do set "PET_PORT=%%p"
+echo %PET_PORT%|findstr /R "^[0-9][0-9]*$" >nul 2>nul || set "PET_PORT=8231"
 set "PET_BASE=http://127.0.0.1:%PET_PORT%/dsh-pet-7340"
 set "OLLAMA_URL=http://localhost:11434"
 set "OLLAMA_MODEL=qwen2.5:3b"
@@ -109,15 +111,22 @@ if errorlevel 1 (
 
 rem ── [6/6] 启动本地服务与桌宠 ──
 echo [6/6] 启动本地服务与桌宠 ...
-netstat -an | findstr /R /C:":%PET_PORT% .*LISTENING" >nul
-if errorlevel 1 (
+set "PET_LOG_DIR=%PET_DIR%\.data\logs"
+set "PET_LOG=%PET_LOG_DIR%\pet-server.log"
+set "PET_ERR_LOG=%PET_LOG_DIR%\pet-server.err.log"
+call :probe_health
+if not errorlevel 1 (
+  echo       OK - pet-server 已在运行（端口 %PET_PORT%），跳过启动
+) else (
   echo       启动 pet-server（端口 %PET_PORT%）...
-  pushd "%PET_DIR%"
-  start "dafeiyu-pet-server" /min cmd /c "node scripts\ollama-pet-server.mjs %PET_PORT%"
+  if not exist "%PET_LOG_DIR%" mkdir "%PET_LOG_DIR%" >nul 2>nul
+  rem 隐藏窗口常驻 + 输出重定向到日志：此前用 start /min cmd /c，服务一旦意外退出既无痕迹也无法
+  rem 感知，用户只能看到"桌宠开着但所有功能没反应"。现在出问题可回看日志，启动器也会打印日志尾部。
+  powershell -NoProfile -Command "Start-Process -FilePath 'node' -ArgumentList @('scripts\ollama-pet-server.mjs','%PET_PORT%') -WorkingDirectory '%PET_DIR%' -WindowStyle Hidden -RedirectStandardOutput '%PET_LOG%' -RedirectStandardError '%PET_ERR_LOG%'"
   set "SERVER_READY="
-  for /l %%i in (1,1,15) do (
+  for /l %%i in (1,1,20) do (
     if not defined SERVER_READY (
-      powershell -NoProfile -Command "try{$c=New-Object Net.Sockets.TcpClient;$c.Connect('127.0.0.1',%PET_PORT%);$c.Close();exit 0}catch{exit 1}" >nul 2>nul
+      call :probe_health
       if not errorlevel 1 (
         set "SERVER_READY=1"
       ) else (
@@ -125,21 +134,23 @@ if errorlevel 1 (
       )
     )
   )
-  popd
   if not defined SERVER_READY (
-    echo   [错误] pet-server 在 15 秒内未就绪（端口 %PET_PORT%）。
-    echo          请查看任务栏中「dafeiyu-pet-server」窗口的报错信息。
+    echo   [错误] pet-server 在 20 秒内未就绪（端口 %PET_PORT%）。
+    echo          —— 错误日志 %PET_ERR_LOG% ——
+    powershell -NoProfile -Command "Get-Content -LiteralPath '%PET_ERR_LOG%' -Tail 20 -ErrorAction SilentlyContinue"
+    echo          —— 运行日志 %PET_LOG% ——
+    powershell -NoProfile -Command "Get-Content -LiteralPath '%PET_LOG%' -Tail 20 -ErrorAction SilentlyContinue"
+    echo          常见原因：端口 %PET_PORT% 被其它程序占用、Node.js 版本过低、或日志中的报错。
     goto :fail
   )
-  echo       OK - pet-server 已就绪
-) else (
-  echo       OK - pet-server 已在运行，跳过启动
+  echo       OK - pet-server 已就绪（日志：%PET_LOG%）
 )
 
 echo.
 echo ------------------------------------------------------------
 echo   正在启动桌宠窗口 ...
-echo   关闭本窗口即结束桌宠进程。
+echo   关闭本窗口即结束桌宠本体（本地服务为后台常驻，不会随之停止；
+echo   需要停止请在任务管理器中结束 node.exe）。
 echo ------------------------------------------------------------
 echo.
 pushd "%PET_DIR%"
@@ -158,6 +169,11 @@ echo.
 echo  桌宠已退出。
 pause
 exit /b 0
+
+:probe_health
+rem /health 返回 200 视为就绪（比裸 TCP 更可靠：端口通了不代表服务真的可用）
+powershell -NoProfile -Command "try{$r=Invoke-WebRequest -Uri 'http://127.0.0.1:%PET_PORT%/dsh-pet-7340/health' -UseBasicParsing -TimeoutSec 2;if($r.StatusCode -eq 200){exit 0}}catch{};exit 1" >nul 2>nul
+exit /b %errorlevel%
 
 :fail
 echo.

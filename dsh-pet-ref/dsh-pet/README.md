@@ -53,7 +53,8 @@ macOS 的 Safari/WKWebView 下透明动画需用 `.mov` 素材，三步：
 - **碎碎念**：宠物时不时自己冒一句——按 `eventsRefreshSec.whisper` 周期（默认 300 秒）调用当前会话所用的模型生成（人设 = 全局 `whisperPrompt`，另追加一句名字声明），气泡展示 10 秒；右键菜单「碎碎念」可立即催一句（绕过节流，同一实例的多端一起看到）。**默认关闭**，按宠物开（`pets[].whisperEnabled`）
 - **对话**：右键「对话」弹窗跟宠物聊天，也能用 `/chat <消息>` 命令（留空 = 催一句碎碎念）——记忆持久化在 `$DSH_HOME/dsh-pet/memory.json`（**全存不删**，每次请求只带最近 `chatMemoryRounds` 轮），浏览器与桌面共享同一份记忆；对话目标为 `/pet` 选中的那只，未选则取列表第一只
 - **表情包配图（0.2.9）**：气泡可以带一张表情包——碎碎念**随机抽 1 张**（`whisperImageEnabled`：只是把这张图的描述加进同一次请求，约 +100 字符 / ≈60 token，增量可忽略）；对话把**整张清单**交给模型按语境选（`chatImageEnabled`：每条消息约 +1.1k 字符 / ≈650 token，约碎碎念配图的 11 倍，随图片数量线性增长）。图片与描述的映射在 `memes`（键 = 包内 `assets/memes/<键>.png`），两个开关默认都关
-- **右键级联菜单**：右键宠物弹出（桌面与浏览器共用同一份组件，`src/shared/menu.ts`）——桌面端根项「**打开网站** / **查看余额** / **回到初始位置** + **动作**」、浏览器端「**回到初始位置** + **动作**」；「打开网站」用**系统默认浏览器**打开 DSH 网站（等效网页里 Ctrl+点击链接）；「查看余额」立即拉余额弹气泡播档位动画（与周期触发同一展示路径）；「回到初始位置」停漫游回配置角落；**动作 → 分类 → 具体动画**（分类 = 待机/转向/拖拽/点击回应/移动/随机动作分类/余额档位；**点播「移动」分类动画会真实行走一段**——边界检查/随机距离/起停时段与随机移动完全一致；noMirror 文字类朝右时自动强制朝左）——浏览器端只在宠物命中区拦截右键（`preventDefault`），完全不进入/改动 DSH 页面自己的菜单
+- **番茄钟**：桌面右键「番茄钟」→ 开始专注 / 停止 / 设置时长（任务名 + 专注·休息分钟数，写入 `assets/pomo.json`）——服务端按时长自动在**专注 ↔ 休息**间轮转，专注期间每 5 分钟轻提醒一句；运行中宠物头顶常驻**剩余时间角标**（专注暖红 / 休息暖绿），因此**不占用对话气泡**——番茄钟与对话、碎碎念可同时使用（气泡优先级：连接告警 > 瞬时消息 > 工作状态 > 余额）
+- **右键级联菜单**：右键宠物弹出（桌面与浏览器共用同一份组件，`src/shared/menu.ts`）——桌面端根项「**AI 设置** / **番茄钟** / **服务控制台** / **端口设置…** / **查看余额** / **回到初始位置** + **动作**」、浏览器端「**回到初始位置** + **动作**」；「**AI 设置**」列出本机 Ollama 已装模型（`/ai/models`），选中即切换、立即生效；「**服务控制台**」用**系统默认浏览器**打开本地服务的**可操作页面**（状态 + 番茄钟 + 模型 + 端口同页操作，见下节 API）；「**端口设置…**」读写服务端口（`.data/server.json`，重启生效）；「查看余额」立即拉余额弹气泡播档位动画（与周期触发同一展示路径）；「回到初始位置」停漫游回配置角落；**动作 → 分类 → 具体动画**（分类 = 待机/转向/拖拽/点击回应/移动/随机动作分类/余额档位；**点播「移动」分类动画会真实行走一段**——边界检查/随机距离/起停时段与随机移动完全一致；noMirror 文字类朝右时自动强制朝左）——浏览器端只在宠物命中区拦截右键（`preventDefault`），完全不进入/改动 DSH 页面自己的菜单
 - **左右朝向**：所有动画 CSS 镜像，人物可朝左 / 朝右
 - **落地对齐**：动画统一脚底线，宠物始终站在"地面"上
 - **流畅切换**：双缓冲 video 交叉淡入，切换零空白帧
@@ -188,6 +189,77 @@ $DSH_HOME/dsh-pet/pet/
 - 配置非法 / 缺少 `-animation/` 目录 / 实例 id 与主宠物冲突 → 加载时显式报错并跳过该宠物（不影响其他宠物）
 - 设置页**不列出**文件宠物（改文件即生效，刷新可见）；设置页保存/恢复默认不会把它们写进 `main-config.json`
 - 添加/修改/删除 → 刷新页面（浏览器）或重启 Helper（桌面）生效
+
+## 🔌 本地服务 HTTP API
+
+桌面模式由本地服务提供数据（`scripts/ollama-pet-server.mjs`）。**基址** = `http://127.0.0.1:<端口>/dsh-pet-7340`，
+默认端口 `8231`。所有应答均为 `application/json; charset=utf-8`（含 `ok` 字段）。
+
+### 端口
+
+端口解析优先级（高 → 低）：**命令行参数** > **环境变量 `PET_PORT`** > **`.data/server.json`** > **`8231`**。
+
+| 方式       | 做法                                                                              |
+| ---------- | --------------------------------------------------------------------------------- |
+| 图形界面   | 右键桌宠 →「端口设置…」→ 填端口 → 保存（写入 `.data/server.json`，**重启后生效**） |
+| 手动改配置 | 编辑 `.data/server.json`：`{ "port": 9123 }`                                       |
+| 一次性     | 启动时传参：`node scripts/ollama-pet-server.mjs 9123`，或设环境变量 `PET_PORT=9123` |
+
+> 端口是进程启动参数，**运行期不可热改**：`POST /server/port` 只落盘并返回 `restartRequired`，不会当场切换。
+
+### 端点
+
+| 方法             | 路径             | 说明                                                                                                                                     |
+| ---------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`            | `/health`        | 健康检查：`{ok, port, uptimeMs, model, ollamaUrl, pomo:{enabled,state,task,remainMs}}`。客户端每 3s 探测一次，连续失败即弹连接告警气泡 |
+| `GET`            | `/ai/config`     | 当前 AI 配置：`{ok, model, url}`                                                                                                         |
+| `POST`           | `/ai/config`     | **切换模型**：体 `{model?, url?}`，如 `{"model":"qwen2.5:7b"}`；写盘 `.data/ai.json`，**立即生效**（下一句对话即用新模型）                |
+| `GET`            | `/ai/models`     | **已安装模型列表**（代理 Ollama `GET /api/tags`）：`{ok, current, url, models:[...]}`；Ollama 不可达 → `{ok:false, message}`              |
+| `GET`            | `/pomo/status`   | 番茄钟状态：`{ok, state:'idle'\|'work'\|'rest', task, endsAt, remainMs, enabled, workMin, restMin}`                                      |
+| `POST`           | `/pomo/start`    | **开始一轮专注**：体 `{task?, workMin?, restMin?}`（缺省用 `.data/…`/配置）；返回 `{ok, state, task}`                                    |
+| `POST`           | `/pomo/stop`     | 停止番茄钟并清空工作状态                                                                                                                 |
+| `GET` / `POST`   | `/pomo/config`   | 读写番茄钟配置：`{ok, config:{enabled,task,workMin,restMin}}`（POST 写 `assets/pomo.json`）                                               |
+| `POST`           | `/chat`          | 对话：体 `{text}`，返回 `{ok, reply, ts}`；失败 `{ok:false, reason, message}`                                                            |
+| `GET`            | `/chat`          | 最近记忆窗口（调试用）：`{ok, messages:[...]}`                                                                                           |
+| `GET`            | `/whisper`       | 取碎碎念（首次/无缓存时触发生成）；`/whisper/trigger` 强制重新生成                                                                       |
+| `GET`            | `/balance`       | 余额状态；`/balance/trigger` 手动触发                                                                                                    |
+| `GET`            | `/work-status`   | 工作状态快照（`{state, task, ts}`），驱动工作档位动画与气泡                                                                               |
+| `GET` / `POST`   | `/server/port`   | 读当前端口与配置文件端口；POST 体 `{port}` 写 `.data/server.json`，返回 `{ok, port, configured, restartRequired}`                        |
+
+示例：
+
+```sh
+# 查健康状态
+curl http://127.0.0.1:8231/dsh-pet-7340/health
+
+# 列出已安装模型
+curl http://127.0.0.1:8231/dsh-pet-7340/ai/models
+
+# 切换模型（立即生效）
+curl -X POST http://127.0.0.1:8231/dsh-pet-7340/ai/config \
+  -H 'content-type: application/json' -d '{"model":"qwen2.5:7b"}'
+
+# 开始一轮 25 分钟番茄钟
+curl -X POST http://127.0.0.1:8231/dsh-pet-7340/pomo/start \
+  -H 'content-type: application/json' -d '{"task":"写文档","workMin":25}'
+
+# 把服务端口改成 9123（重启后生效）
+curl -X POST http://127.0.0.1:8231/dsh-pet-7340/server/port \
+  -H 'content-type: application/json' -d '{"port":9123}'
+```
+
+### 相关文件
+
+| 路径                     | 作用                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------- |
+| `.data/server.json`      | 服务端口（右键「端口设置…」写入；启动器优先读它）                                |
+| `.data/ai.json`          | AI 配置（模型名 / Ollama 地址；右键「AI 设置」写入）                             |
+| `.data/memory.json`      | 对话记忆（全存不删，每次请求只取最近 `chatMemoryRounds` 轮）                     |
+| `assets/pomo.json`       | 番茄钟配置（`enabled` / `task` / `workMin` / `restMin`；右键「番茄钟 → 设置时长」写入） |
+| `.data/logs/`            | 启动器重定向的服务端日志（`stdout` / `stderr`；启动失败时终端会打印尾部）        |
+
+> 服务端进程级兜底了 `uncaughtException` / `unhandledRejection`（单次请求异常不会拖垮服务）；端口被占用时启动器会
+> 直接失败并打印日志，不会静默留一个不可用的桌面。
 
 ## 🗑️ 卸载
 

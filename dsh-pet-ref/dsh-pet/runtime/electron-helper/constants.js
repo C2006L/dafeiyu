@@ -126,6 +126,13 @@ const TRIGGER_URL = BASE + '/balance/trigger';
 const WHISPER_URL = BASE + '/whisper';
 const WORK_STATUS_URL = BASE + '/work-status'; // 工作状态联动：1s 轮询，ts 变化才触发（与浏览器同一端点）
 const BUBBLE_DURATION_MS = 10 * 1000; // 余额/碎碎念气泡展示时长（与浏览器一致：定时自动消失，与动画解耦）
+// 工作状态（非终态）气泡的限时展示时长：不再常驻——常驻会把气泡永久占住，
+// 对话/碎碎念/切换提示永远没有出场机会；番茄钟的持续可见性由「剩余时间角标」承担
+const WORK_BUBBLE_DURATION_MS = 30 * 1000;
+// 本地服务连接失败提示：连续探测失败时以**最高优先级**展示（连接失败必须可见，不再静默）
+const LINK_ERROR_ROWS = ['⚠ 连不上本地服务', '对话 / 番茄钟 / 碎碎念 暂不可用', '请重新运行「启动大肥鱼桌宠.bat」'];
+const LINK_PROBE_INTERVAL_MS = 3000; // /health 探测周期
+const LINK_FAIL_THRESHOLD = 3; // 连续失败多少次才告警（避免瞬时抖动刷屏）
 // 窗口四周外扩 = 该比例 × 宠物尺寸：为气泡 / 未来可能的弹窗预留显示空间；
 // 外扩区透明且点击穿透（只有身体命中区可交互）。单点可调——按实际观感改这里。
 const WINDOW_MARGIN_RATIO = 0.5;
@@ -151,6 +158,9 @@ window.__dshPetDebug = {
   lastBalanceOk: null,
   menuOpen: false,
   chatOpen: false,
+  linkDown: false,
+  linkFailures: 0,
+  pomoBadge: '',
   bootAt: Date.now(),
 };
 window.addEventListener('error', (event) => {

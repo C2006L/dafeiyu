@@ -120,6 +120,19 @@ class PetSprite {
     this.chatClose = null;
     this.chatOpen = false;
 
+    // 本地服务连通性（3s 探测 /health；连续失败即气泡告警，恢复后自动收起）
+    this.linkDown = false;
+    this.linkFailures = 0;
+    this.linkLoopTimer = null;
+
+    // 番茄钟剩余时间角标（常驻小胶囊）：番茄钟的"持续可见性"由它承担，
+    // 工作状态气泡因此可以限时收起、把气泡让给对话/碎碎念（见 renderBubble 优先级）
+    this.pomoRunning = false;
+    this.pomoPhase = 'idle';
+    this.pomoTask = '';
+    this.pomoEndsAt = 0;
+    this.pomoLoopTimer = null;
+
     // DOM：sprite 钉在窗口内 (margin.l, margin.t)；宠物"位置"= sprite 位置，窗口随余量外扩
     this.el = document.createElement('div');
     this.el.className = 'pet-sprite';
@@ -149,11 +162,15 @@ class PetSprite {
     this.hit.title = this.pet.name;
     this.bubble = document.createElement('div');
     this.bubble.className = 'pet-bubble';
+    // 番茄钟剩余时间角标：胶囊小标签，钉在 sprite 右上角（与气泡同层，不参与点击）
+    this.pomoEl = document.createElement('div');
+    this.pomoEl.className = 'pet-pomo';
 
     stage.appendChild(this.videoA);
     stage.appendChild(this.videoB);
     stage.appendChild(this.hit);
     this.el.appendChild(this.bubble);
+    this.el.appendChild(this.pomoEl);
     this.el.appendChild(stage);
     rootEl.appendChild(this.el);
     this.position();
@@ -1022,11 +1039,20 @@ class PetSprite {
     e.preventDefault();
     this.stopThrow(); // 菜单弹出前停住飞行中的宠物
     this.stopMove(); // 菜单悬停期间宠物不漫游
-    // 桌面专属工具根项（AI 设置 / 打开网站 / 查看余额 / 碎碎念 / 对话 / 回到初始位置）+ 共享菜单树
+    // 桌面专属工具根项（AI 设置 / 番茄钟 / 服务控制台 / 端口设置 / 查看余额 / 碎碎念 / 对话 / 回到初始位置）+ 共享菜单树
     // 碎碎念/对话项无条件显示：手动触发不受 whisperEnabled 限制（该字段只影响自动周期轮询）
     const tools = [
       { label: 'AI 设置', action: 'ai-settings' },
-      { label: '打开网站', action: 'open-site' },
+      {
+        label: '番茄钟',
+        children: [
+          { label: '开始专注', action: 'pomo-start' },
+          { label: '停止', action: 'pomo-stop' },
+          { label: '设置时长…', action: 'pomo-config' },
+        ],
+      },
+      { label: '服务控制台', action: 'open-console' },
+      { label: '端口设置…', action: 'port-config' },
     ];
     if (this.pet.balanceEnabled) tools.push({ label: '查看余额', action: 'show-balance' });
     tools.push(
@@ -1064,8 +1090,27 @@ class PetSprite {
       this.showAiSettings(); // 右键随时切换本地 Ollama 模型，立即生效
       return;
     }
-    if (leaf.action === 'open-site') {
-      if (window.petBridge) window.petBridge.openDshSite(ORIGIN); // 系统默认浏览器打开（等效 Ctrl+点击链接）
+    if (leaf.action === 'open-console') {
+      // 系统默认浏览器打开服务控制台（本地部署下 ORIGIN 就是 pet-server 地址，端口变化自动跟随；
+      // 宿主 bridge 模式下无本地 pet-server，退化为打开宿主站点）。只读信息页没人看得懂能干什么，
+      // 故升级为可操作页面（状态 / 番茄钟 / 模型 / 端口同页操作）。
+      if (window.petBridge) window.petBridge.openConsole(ORIGIN);
+      return;
+    }
+    if (leaf.action === 'port-config') {
+      this.showPortSettings(); // 读写 .data/server.json（重启后生效）
+      return;
+    }
+    if (leaf.action === 'pomo-start') {
+      this.pomoStart(); // 用当前配置立即开始一轮专注（时长/任务名可在「设置时长…」里改）
+      return;
+    }
+    if (leaf.action === 'pomo-stop') {
+      this.pomoStop();
+      return;
+    }
+    if (leaf.action === 'pomo-config') {
+      this.showPomoSettings(); // 写回 assets/pomo.json（下次启动仍生效）
       return;
     }
     if (leaf.action === 'show-balance') {
@@ -1187,28 +1232,69 @@ class PetSprite {
     this.setInteractive(true);
   }
 
-  // 「AI 设置」菜单：右键切换本地 Ollama 模型（Electron 无 window.prompt，自绘输入框；
-  // 菜单关闭会恢复穿透，所以输入框打开期间整窗保持可交互，关闭时再交还）
+  // 「AI 设置」菜单：右键切换本地 Ollama 模型。列表来自服务端 `/ai/models`（代理 Ollama /api/tags）——
+  // 此前是个自由输入框，用户必须凭记忆敲对模型名，敲错只能从"设置失败"里猜，故形同不可用。
+  // Ollama 不可达时**显式提示原因**（而不是给个空列表），并保留手动输入作为兜底。
+  // Electron 无 window.prompt，故自绘弹窗；输入框打开期间整窗保持可交互，关闭时再交还穿透。
   async showAiSettings() {
     this.aiSettingsOpen = true;
     this.setInteractive(true);
     this.syncInputBusy();
-    let current = { model: 'qwen2.5:3b' };
+    let current = { model: '', url: '' };
     try {
       current = await fetch(BASE + '/ai/config', { cache: 'no-store' }).then((r) => r.json());
     } catch (e) {
       console.warn('[dsh-pet] 读取 AI 配置失败', e);
     }
+    // 已装模型列表：ok=false 表示 Ollama 本身不可达（不是"没装模型"），原因要如实显示
+    let list = { ok: false, models: [], message: '' };
+    try {
+      list = await fetch(BASE + '/ai/models', { cache: 'no-store' }).then((r) => r.json());
+    } catch (e) {
+      list.message = String(e && e.message ? e.message : e);
+    }
     const root = document.createElement('div');
     root.style.cssText = 'position:fixed;z-index:2147483003;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.10);';
     const box = document.createElement('div');
-    box.style.cssText = 'background:#fff;border-radius:12px;padding:16px 18px;box-shadow:0 10px 32px rgba(0,0,0,.25);font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;min-width:290px;';
+    box.style.cssText = 'background:#fff;border-radius:12px;padding:16px 18px;box-shadow:0 10px 32px rgba(0,0,0,.25);font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;min-width:320px;';
     const label = document.createElement('div');
     label.textContent = '切换 Ollama 模型（当前：' + (current.model || '未知') + '）';
     label.style.cssText = 'font-size:13px;color:#555;margin-bottom:10px;';
+    box.appendChild(label);
     const input = document.createElement('input');
-    input.value = current.model || 'qwen2.5:3b';
+    input.value = current.model || '';
+    input.placeholder = '模型名，如 qwen2.5:3b';
     input.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #d5dbe8;border-radius:8px;font-size:14px;outline:none;';
+    const models = Array.isArray(list.models) ? list.models : [];
+    if (list.ok && models.length > 0) {
+      // 下拉只是**快捷填入**：真值始终以上面的输入框为准（列表可能不含想用的模型，如尚未 pull）
+      const select = document.createElement('select');
+      select.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;margin-bottom:8px;border:1px solid #d5dbe8;border-radius:8px;font-size:14px;outline:none;background:#fff;';
+      for (const name of models) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        if (name === current.model) opt.selected = true;
+        select.appendChild(opt);
+      }
+      select.onchange = () => {
+        input.value = select.value;
+      };
+      box.appendChild(select);
+      const tip = document.createElement('div');
+      tip.textContent = '共 ' + models.length + ' 个已安装模型（来自 Ollama）';
+      tip.style.cssText = 'font-size:11px;color:#8a94a6;margin-bottom:8px;';
+      box.appendChild(tip);
+    } else {
+      const warn = document.createElement('div');
+      warn.textContent =
+        '⚠ 拿不到模型列表：' +
+        (list.message || '未知原因') +
+        '。请确认 Ollama 已启动（命令行执行 ollama serve），仍可在下方手动输入模型名。';
+      warn.style.cssText = 'font-size:12px;line-height:1.5;color:#b3352a;background:#fff6f3;border-radius:8px;padding:8px 10px;margin-bottom:8px;';
+      box.appendChild(warn);
+    }
+    box.appendChild(input);
     const row = document.createElement('div');
     row.style.cssText = 'margin-top:12px;display:flex;justify-content:flex-end;gap:8px;';
     const cancel = document.createElement('button');
@@ -1226,8 +1312,11 @@ class PetSprite {
     cancel.onclick = finish;
     ok.onclick = async () => {
       const model = input.value.trim();
+      if (!model) {
+        input.focus();
+        return;
+      }
       finish();
-      if (!model) return;
       try {
         const res = await fetch(BASE + '/ai/config', {
           method: 'POST',
@@ -1255,12 +1344,227 @@ class PetSprite {
     });
     row.appendChild(cancel);
     row.appendChild(ok);
-    box.appendChild(label);
-    box.appendChild(input);
     box.appendChild(row);
     root.appendChild(box);
     document.body.appendChild(root);
     input.focus();
+  }
+
+  // 「端口设置…」菜单：读/写服务端口（`.data/server.json`，由启动器在下次启动时传给服务端）。
+  // 端口是进程启动参数、运行期不可热改，因此保存后如实告知"重启后生效"（不假装立即切换）。
+  async showPortSettings() {
+    this.setInteractive(true);
+    this.syncInputBusy();
+    let info = { port: 0, configured: 0 };
+    try {
+      info = await fetch(BASE + '/server/port', { cache: 'no-store' }).then((r) => r.json());
+    } catch (e) {
+      console.warn('[dsh-pet] 读取端口配置失败', e);
+    }
+    const currentPort = info.configured || info.port || 8231;
+    const root = document.createElement('div');
+    root.style.cssText = 'position:fixed;z-index:2147483003;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.10);';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#fff;border-radius:12px;padding:16px 18px;box-shadow:0 10px 32px rgba(0,0,0,.25);font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;min-width:320px;';
+    const label = document.createElement('div');
+    label.textContent = '本地服务端口（当前生效：' + (info.port || '未知') + '）';
+    label.style.cssText = 'font-size:13px;color:#555;margin-bottom:10px;';
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = '1';
+    input.max = '65535';
+    input.value = String(currentPort);
+    input.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #d5dbe8;border-radius:8px;font-size:14px;outline:none;';
+    const tip = document.createElement('div');
+    tip.textContent = '写入 .data/server.json，重启桌宠后生效（端口被占用时启动器会给出日志提示）。';
+    tip.style.cssText = 'font-size:11px;line-height:1.5;color:#8a94a6;margin-top:8px;';
+    const row = document.createElement('div');
+    row.style.cssText = 'margin-top:12px;display:flex;justify-content:flex-end;gap:8px;';
+    const cancel = document.createElement('button');
+    cancel.textContent = '取消';
+    cancel.style.cssText = 'background:#f0f2f7;color:#555;border:none;border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer;';
+    const ok = document.createElement('button');
+    ok.textContent = '保存';
+    ok.style.cssText = 'background:#5686fe;color:#fff;border:none;border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer;';
+    const finish = () => {
+      this.syncInputBusy();
+      this.setInteractive(false);
+      root.remove();
+    };
+    cancel.onclick = finish;
+    ok.onclick = async () => {
+      const port = Number(input.value);
+      if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+        this.showWhisper('端口必须是 1-65535 之间的整数');
+        return;
+      }
+      finish();
+      try {
+        const res = await fetch(BASE + '/server/port', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ port }),
+          cache: 'no-store',
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          this.showWhisper(
+            data.restartRequired ? '端口已保存为 ' + port + '，重启桌宠后生效' : '端口已是 ' + port + '，无需改动',
+          );
+        } else {
+          this.showWhisper('端口保存失败：' + (data && data.message ? data.message : '未知错误'));
+        }
+      } catch (e) {
+        this.showWhisper('端口保存失败：' + (e.message || e));
+      }
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') ok.click();
+      if (e.key === 'Escape') finish();
+    });
+    root.addEventListener('mousedown', (e) => {
+      if (e.target === root) finish();
+    });
+    row.appendChild(cancel);
+    row.appendChild(ok);
+    box.appendChild(label);
+    box.appendChild(input);
+    box.appendChild(tip);
+    box.appendChild(row);
+    root.appendChild(box);
+    document.body.appendChild(root);
+    input.focus();
+  }
+
+  // 「番茄钟 → 开始专注 / 停止」：直接驱动服务端状态机；回执走**瞬时气泡**通道
+  // （瞬时气泡优先级高于工作状态气泡，所以这些回执不会被番茄钟自己的气泡挡掉）
+  pomoStart() {
+    this.pomoPost('/pomo/start', {}, (d) => '开始专注：' + (d.task || '专注'));
+  }
+
+  pomoStop() {
+    this.pomoPost('/pomo/stop', {}, () => '番茄钟已停止');
+  }
+
+  /** 番茄钟请求 + 回执：失败一律显式提示（服务不可用时也说清原因，不静默） */
+  pomoPost(path, body, okText) {
+    fetch(BASE + path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      cache: 'no-store',
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && d.ok) {
+          this.showWhisper(okText(d));
+          void this.syncPomo(); // 立即刷新剩余时间角标，不等下一个轮询周期
+        } else {
+          this.showWhisper('番茄钟操作失败：' + (d && d.message ? d.message : '未知错误'));
+        }
+      })
+      .catch((e) => this.showWhisper('番茄钟操作失败：' + (e.message || e)));
+  }
+
+  // 「番茄钟 → 设置时长…」：任务名 + 专注/休息分钟数，写回 assets/pomo.json（下次启动同样生效）。
+  // 与「AI 设置」同一套自绘弹窗（Electron 无 window.prompt），弹窗期间整窗保持可交互。
+  async showPomoSettings() {
+    this.setInteractive(true);
+    this.syncInputBusy();
+    let cfg = { task: '专注', workMin: 25, restMin: 5 };
+    try {
+      const d = await fetch(BASE + '/pomo/config', { cache: 'no-store' }).then((r) => r.json());
+      if (d && d.ok && d.config) cfg = d.config;
+    } catch (e) {
+      console.warn('[dsh-pet] 读取番茄钟配置失败', e);
+    }
+    const root = document.createElement('div');
+    root.style.cssText =
+      'position:fixed;z-index:2147483003;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.10);';
+    const box = document.createElement('div');
+    box.style.cssText =
+      'background:#fff;border-radius:12px;padding:16px 18px;box-shadow:0 10px 32px rgba(0,0,0,.25);font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;min-width:290px;';
+    const title = document.createElement('div');
+    title.textContent = '番茄钟设置';
+    title.style.cssText = 'font-size:13px;color:#555;margin-bottom:10px;';
+    box.appendChild(title);
+    const fields = [];
+    const addField = (label, value, width) => {
+      const wrap = document.createElement('label');
+      wrap.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px;color:#555;';
+      const span = document.createElement('span');
+      span.textContent = label;
+      span.style.cssText = 'flex:none;width:66px;';
+      const input = document.createElement('input');
+      input.value = String(value);
+      input.style.cssText =
+        'flex:1;min-width:0;box-sizing:border-box;padding:7px 10px;border:1px solid #d5dbe8;border-radius:8px;font-size:14px;outline:none;' +
+        (width || '');
+      wrap.appendChild(span);
+      wrap.appendChild(input);
+      box.appendChild(wrap);
+      fields.push(input);
+      return input;
+    };
+    const taskInput = addField('任务名', cfg.task || '专注');
+    const workInput = addField('专注分钟', cfg.workMin || 25);
+    const restInput = addField('休息分钟', cfg.restMin || 5);
+    const row = document.createElement('div');
+    row.style.cssText = 'margin-top:12px;display:flex;justify-content:flex-end;gap:8px;';
+    const cancel = document.createElement('button');
+    cancel.textContent = '取消';
+    cancel.style.cssText =
+      'background:#f0f2f7;color:#555;border:none;border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer;';
+    const ok = document.createElement('button');
+    ok.textContent = '保存';
+    ok.style.cssText =
+      'background:#5686fe;color:#fff;border:none;border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer;';
+    const finish = () => {
+      this.syncInputBusy();
+      this.setInteractive(false); // 弹窗关：恢复命中区穿透
+      root.remove();
+    };
+    cancel.onclick = finish;
+    ok.onclick = async () => {
+      const payload = {
+        task: taskInput.value.trim() || '专注',
+        workMin: Number(workInput.value) || 25,
+        restMin: Number(restInput.value) || 5,
+      };
+      finish();
+      try {
+        const res = await fetch(BASE + '/pomo/config', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+          cache: 'no-store',
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          const c = data.config || payload;
+          this.showWhisper('番茄钟已保存：' + c.task + ' ' + c.workMin + '/' + c.restMin + ' 分钟');
+        } else {
+          this.showWhisper('番茄钟保存失败：' + (data && data.message ? data.message : '未知错误'));
+        }
+      } catch (e) {
+        this.showWhisper('番茄钟保存失败：' + (e.message || e));
+      }
+    };
+    for (const input of fields) {
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') ok.click();
+        if (e.key === 'Escape') finish();
+      });
+    }
+    root.addEventListener('mousedown', (e) => {
+      if (e.target === root) finish();
+    });
+    row.appendChild(cancel);
+    row.appendChild(ok);
+    box.appendChild(row);
+    root.appendChild(box);
+    document.body.appendChild(root);
+    taskInput.focus();
   }
 
   // 「回到初始位置」菜单：停掉漫游/移动，清掉拖拽/漫游留下的会话位置，回到配置角落
@@ -1272,7 +1576,9 @@ class PetSprite {
   }
 
   renderBubble() {
-    // 气泡优先级：工作状态 > 碎碎念 > 余额（工作状态是 DSH 真实状态，最要紧；三者都关时隐藏）
+    // 气泡优先级：连接告警 > 工作状态 > 碎碎念 > 余额（四者都关时隐藏）
+    // 连接告警置顶：本地服务不可达时任何数据都拿不到，必须让用户看见（此前整条链路静默失败，
+    // 用户看到的是"桌宠开着但没反应"）。工作状态是 DSH 真实状态，其次最要紧。
     // 工作气泡与碎碎念同款弹窗样式：宽度自适应 + 自动换行（is-whisper：正常 white-space、宽随内容）
     // 配图标记交给 CSS：带图时取消 min-width（样式在 shared 的 MEME_BUBBLE_CSS，两端同一份）。
     // 图片 URL 与视频同规则：传 BASE 前缀（桌面是 file:// 页面，必须绝对地址）
@@ -1280,11 +1586,39 @@ class PetSprite {
     this.bubble.classList.toggle(
       'is-whisper',
       // 余额「文字说明」（不可用状态）同样要换行变体：默认 nowrap 会把长文案顶出宠物宽度
-      this.workOn || (this.whisperOn && !!this.whisperView) || (this.bubbleOn && this.balanceWrap),
+      this.linkDown || this.workOn || (this.whisperOn && !!this.whisperView) || (this.bubbleOn && this.balanceWrap),
     );
     this.bubble.classList.toggle(S.MEME_BUBBLE_CLASS, !!whisperImg);
+    this.bubble.classList.toggle('is-link-error', !!this.linkDown);
+    if (this.linkDown) {
+      this.bubble.innerHTML = '';
+      for (const row of LINK_ERROR_ROWS) {
+        const div = document.createElement('div');
+        div.textContent = row;
+        this.bubble.appendChild(div);
+      }
+      this.bubble.classList.add('is-on');
+      window.__dshPetDebug.lastBubbleTitle = this.bubble.textContent.slice(0, 60);
+      return;
+    }
+    // 瞬时消息（碎碎念 / 对话回复 / 切换提示）优先于工作状态：单一气泡物理上只能显示一条，
+    // 让常驻的工作状态作为"回落目标"、瞬时消息插播其上——番茄钟与对话才能真正并行使用。
+    // （此前 work 常驻且直接 return，把碎碎念/对话回复/切换提示全部挡死，气泡永远停在「背单词」。）
+    if (this.whisperOn && this.whisperView) {
+      this.bubble.innerHTML = '';
+      // 配图（shared 生成的 <img> + 共用样式）：先看图再读话，符合"配图"的阅读顺序
+      if (whisperImg) this.bubble.appendChild(whisperImg);
+      const line = document.createElement('div');
+      line.className = 'pet-bub-row';
+      line.textContent = this.whisperView[0]?.text ?? '';
+      this.bubble.appendChild(line);
+      this.bubble.classList.add('is-on');
+      window.__dshPetDebug.lastBubbleTitle = this.bubble.textContent.slice(0, 60);
+      return;
+    }
     if (this.workOn) {
-      // 工作状态气泡：workOn 期间占位（文本缺失时隐藏，绝不让更弱的碎碎念/余额气泡反超）
+      // 工作状态气泡：限时展示（WORK_BUBBLE_DURATION_MS，由 onWorkTick 定时收起），
+      // 文本缺失时隐藏；优先级仍高于余额（余额最弱，不反超工作状态）
       if (!this.workText) {
         this.bubble.classList.remove('is-on');
         window.__dshPetDebug.lastBubbleTitle = '';
@@ -1294,18 +1628,6 @@ class PetSprite {
       const line = document.createElement('div');
       line.className = 'pet-bub-row';
       line.textContent = this.workText;
-      this.bubble.appendChild(line);
-      this.bubble.classList.add('is-on');
-      window.__dshPetDebug.lastBubbleTitle = this.bubble.textContent.slice(0, 60);
-      return;
-    }
-    if (this.whisperOn && this.whisperView) {
-      this.bubble.innerHTML = '';
-      // 配图（shared 生成的 <img> + 共用样式）：先看图再读话，符合"配图"的阅读顺序
-      if (whisperImg) this.bubble.appendChild(whisperImg);
-      const line = document.createElement('div');
-      line.className = 'pet-bub-row';
-      line.textContent = this.whisperView[0]?.text ?? '';
       this.bubble.appendChild(line);
       this.bubble.classList.add('is-on');
       window.__dshPetDebug.lastBubbleTitle = this.bubble.textContent.slice(0, 60);
