@@ -24,13 +24,20 @@ import { flattenConfigPets } from './config.ts';
 import { readAllConfig } from '../host/config.ts';
 import type { Pet } from './types.ts';
 
-/** 条目级字段清单：客户端渲染直接消费，缺一不可 */
+/**
+ * 条目级字段清单：客户端渲染直接消费，缺一不可。
+ *
+ * 不含 workStatusTexts —— 它是唯一**可选**的条目级字段：默认配置刻意停用
+ * （见 assets/config.jsonc「工作状态联动文案已停用」），缺省合法。消费端
+ * src/client/pet.ts 用 Array.isArray 防御（缺省 = 只播动画、不弹文案），
+ * 故不存在 physics 那类"缺省即 TypeError"的风险。flattenConfigPets 仍会原样
+ * 透传该字段，这里不断言其存在。
+ */
 const ENTRY_FIELDS: Array<keyof Pet> = [
   'animations',
   'animationWeights',
   'eventsRefreshSec',
   'physics',
-  'workStatusTexts',
 ];
 
 /** 包内文件源码（守卫用；相对 src/shared/ 解析） */
