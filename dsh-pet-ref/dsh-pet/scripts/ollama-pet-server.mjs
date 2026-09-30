@@ -4,7 +4,7 @@
  *
  * 让 dsh-pet 的桌面模式（Electron 透明窗）完全脱离 DeepSeek Harness 运行：
  *   - 素材 / 配置：直接读本包 assets/
- *   - 碎碎念 / 对话：调用本地 Ollama（默认 qwen2.5:3b）
+ *   - 碎碎念 / 对话：调用 AI 后端（默认本机 Ollama，也可切到任意 OpenAI 兼容服务）
  *   - 番茄钟：独立状态机，通过 /work-status 档位动画 + 督促语气泡驱动
  *
  * 契约对齐 src/host/index.ts 的 handlePetRoute + scripts/dev/mock-server.mjs。
@@ -16,8 +16,15 @@
  *   OLLAMA_URL        Ollama 地址（默认 http://localhost:11434）
  *   OLLAMA_MODEL      模型名（默认 qwen2.5:3b）
  *   PET_DATA_DIR      数据目录（记忆/番茄钟配置，默认本包 .data）
+ *
+ * AI 后端（.data/ai.json；服务控制台「AI 模型」卡片或右键「AI 设置」弹窗可改；env 只提供默认值）：
+ *   provider  'ollama'（默认）：打本机 `{url}/api/chat`
+ *             'openai'        ：打 `{url}/v1/chat/completions`，带 `Authorization: Bearer {apiKey}`
+ *                               —— 覆盖 OpenAI / DeepSeek / 通义千问 / Moonshot / 硅基流动 等
+ *   url / model / apiKey
  */
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join, resolve, normalize, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,6 +51,20 @@ const DATA_DIR = process.env.PET_DATA_DIR || join(PACKAGE_ROOT, '.data');
 const MEMORY_FILE = join(DATA_DIR, 'memory.json');
 const AI_CFG_FILE = join(DATA_DIR, 'ai.json');
 const SERVER_CFG_FILE = join(DATA_DIR, 'server.json');
+
+// ---------- 构建标识（识别「在跑的是哪一份代码」） ----------
+// Node 在启动时把代码读进内存，**之后文件怎么改都不会影响已在运行的进程**。所以「桌宠是新的、网页
+// 却是旧的」这类问题的根因几乎总是：旧进程还占着端口，而启动器只要 /health 返回 200 就判定「已在
+// 运行」并跳过启动，于是新旧混跑且毫无提示。
+// 把本文件内容的 SHA1 前 12 位当构建标识暴露出去（/health 的 build 字段 + 控制台页脚），
+// 启动器据此比对本地源码，就能发现「端口上跑的不是当前这份代码」并接管。
+const BUILD = (() => {
+  try {
+    return createHash('sha1').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12);
+  } catch {
+    return 'unknown'; // 读不到自身源码（打包/裁剪场景）：不阻塞启动，只是失去比对能力
+  }
+})();
 
 // 端口优先级：命令行参数 > 环境变量 PET_PORT > .data/server.json（右键「端口设置」写入）> 8231
 function readConfiguredPort() {
@@ -106,10 +127,14 @@ function saveMemory(mem) {
 }
 
 // ---------- AI 配置（可运行时切换，持久化 .data/ai.json） ----------
-let aiCfg = { model: OLLAMA_MODEL, url: OLLAMA_URL };
+// provider：'ollama' = 本机 Ollama（默认），'openai' = 任意 OpenAI 兼容服务。
+// 归一化：旧版 ai.json 只有 {model,url}，没有 provider —— 这里补成 'ollama'，
+// 老配置无缝继续用（不会因为升级就把用户的本机模型配置弄丢）。
+let aiCfg = { provider: 'ollama', model: OLLAMA_MODEL, url: OLLAMA_URL, apiKey: '' };
 try {
   aiCfg = Object.assign(aiCfg, JSON.parse(readFileSync(AI_CFG_FILE, 'utf8')));
 } catch { /* 首次运行，用默认 */ }
+if (aiCfg.provider !== 'openai') aiCfg.provider = 'ollama';
 function saveAiCfg() {
   try {
     writeFileSync(AI_CFG_FILE, JSON.stringify(aiCfg, null, 2), 'utf8');
@@ -118,22 +143,102 @@ function saveAiCfg() {
   }
 }
 
-// ---------- Ollama 调用 ----------
+// ---------- AI 调用（两种 AI 后端：本机 Ollama / OpenAI 兼容服务） ----------
+
+/** 当前 AI 后端是否 OpenAI 兼容协议 */
+const isOpenAi = () => aiCfg.provider === 'openai';
+/** 用户可读的后端名（错误提示、控制台展示共用） */
+const providerName = () => (isOpenAi() ? 'AI 服务' : 'Ollama');
+
+/**
+ * OpenAI 兼容服务的对话端点。用户填 `https://api.deepseek.com`、
+ * `https://api.openai.com/v1`、`https://.../v1beta` 都应该能直接用，
+ * 所以按后缀补全，而不是硬拼 `/v1/chat/completions`（那会把带 /v1 的地址拼成 /v1/v1/...）。
+ */
+function openAiEndpoint(base) {
+  const u = base.replace(/\/$/, '');
+  if (/\/chat\/completions$/.test(u)) return u;
+  if (/\/v\d+(?:beta)?$/i.test(u)) return u + '/chat/completions';
+  return u + '/v1/chat/completions';
+}
+
+/**
+ * 把"连不上 AI 后端"翻译成用户能照着做的提示。
+ * Node 原生 fetch 在连接层失败时只抛 `TypeError: fetch failed`（真因埋在 e.cause.code），
+ * 原样透到气泡就是「对话失败：fetch failed」——用户既不知道是 Ollama 没开，也不知道该做什么。
+ */
+function aiDownMessage(e) {
+  const cause = e && e.cause;
+  // Node 各版本对连接错误的包装不一致：低版本给 cause.code（ECONNREFUSED），
+  // Node 24 的 cause 可能是个只有 message 的裸 Error（如 "bad port"），故逐层兜底。
+  const code =
+    (e && e.name === 'TimeoutError' && '请求超时') ||
+    (cause && cause.code) ||
+    (cause && Array.isArray(cause.errors) && cause.errors[0] && cause.errors[0].code) ||
+    (cause && cause.message) ||
+    '握手失败';
+  if (isOpenAi()) {
+    return (
+      '连不上 AI 服务（' +
+      aiCfg.url +
+      '，' +
+      code +
+      '）。\n请检查 API 地址是否可访问、网络是否通畅，以及 API Key 是否正确。'
+    );
+  }
+  return (
+    '连不上 Ollama（' +
+    aiCfg.url +
+    '，' +
+    code +
+    '）。\n请先启动 Ollama（ollama serve），并确认模型已拉取（ollama pull ' +
+    aiCfg.model +
+    '）。'
+  );
+}
+
+/** HTTP 错误码 → 用户能懂的一句话（外部 API 的 401/404/429 光看状态码没法排查） */
+function explainHttpError(status, bodyText) {
+  const hit = {
+    400: '请求参数不被服务端接受（检查模型名是否存在）',
+    401: 'API Key 无效或未填写',
+    402: '账户额度不足',
+    403: '无权限访问该模型',
+    404: '接口地址不对（检查是否漏了或多了 /v1）',
+    422: '模型名或参数不合法',
+    429: '请求过于频繁或额度不足',
+  }[status];
+  let detail = '';
+  try {
+    detail = String(JSON.parse(bodyText)?.error?.message || '').trim();
+  } catch {
+    /* 非 JSON 响应：detail 留空，退回原始文本 */
+  }
+  const msg = [hit, detail && '（' + detail.slice(0, 120) + '）'].filter(Boolean).join('');
+  return msg || bodyText.slice(0, 120) || '未知错误';
+}
+
+/** 本机 Ollama：POST {url}/api/chat，回复在 data.message.content */
 async function ollamaChat(messages, opts = {}) {
-  const res = await fetch(aiCfg.url + '/api/chat', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: aiCfg.model,
-      messages,
-      stream: false,
-      options: {
-        temperature: opts.temperature ?? 0.9,
-        num_predict: opts.num_predict ?? 100,
-      },
-    }),
-    signal: AbortSignal.timeout(opts.timeout ?? 90000),
-  });
+  let res;
+  try {
+    res = await fetch(aiCfg.url + '/api/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: aiCfg.model,
+        messages,
+        stream: false,
+        options: {
+          temperature: opts.temperature ?? 0.9,
+          num_predict: opts.num_predict ?? 100,
+        },
+      }),
+      signal: AbortSignal.timeout(opts.timeout ?? 90000),
+    });
+  } catch (e) {
+    throw new Error(aiDownMessage(e));
+  }
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
     throw new Error(`Ollama HTTP ${res.status}: ${txt.slice(0, 80)}`);
@@ -142,6 +247,44 @@ async function ollamaChat(messages, opts = {}) {
   const text = String(data?.message?.content ?? '').trim();
   if (!text) throw new Error('Ollama 未返回文本');
   return text;
+}
+
+/** OpenAI 兼容服务：POST {base}[/v1]/chat/completions，回复在 data.choices[0].message.content */
+async function openAiChat(messages, opts = {}) {
+  const endpoint = openAiEndpoint(aiCfg.url);
+  const headers = { 'content-type': 'application/json' };
+  // 允许空 Key：LM Studio / vLLM 等本地 OpenAI 兼容端点通常不校验鉴权
+  if (aiCfg.apiKey) headers.authorization = 'Bearer ' + aiCfg.apiKey;
+  let res;
+  try {
+    res = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: aiCfg.model,
+        messages,
+        stream: false,
+        temperature: opts.temperature ?? 0.9,
+        max_tokens: opts.num_predict ?? 100,
+      }),
+      signal: AbortSignal.timeout(opts.timeout ?? 90000),
+    });
+  } catch (e) {
+    throw new Error(aiDownMessage(e));
+  }
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`AI 服务 HTTP ${res.status}：${explainHttpError(res.status, txt)}`);
+  }
+  const data = await res.json().catch(() => null);
+  const text = String(data?.choices?.[0]?.message?.content ?? '').trim();
+  if (!text) throw new Error('AI 服务未返回文本（检查模型名是否可用）');
+  return text;
+}
+
+/** 统一入口：按 aiCfg.provider 选后端。碎碎念与对话都走这里 */
+function chatCompletion(messages, opts = {}) {
+  return isOpenAi() ? openAiChat(messages, opts) : ollamaChat(messages, opts);
 }
 
 const WHISPER_SYSTEM = () => getConfig().whisperPrompt || '你是桌面上的小桌宠，会碎碎念一句。';
@@ -156,7 +299,7 @@ async function generateWhisper(manual = false) {
   if (whisperLock) return whisperCache;
   whisperLock = true;
   try {
-    const text = await ollamaChat([
+    const text = await chatCompletion([
       { role: 'system', content: WHISPER_SYSTEM() },
       { role: 'user', content: '随便说一句日常碎碎念，一句就好，20字以内。' },
     ], { num_predict: 40 });
@@ -208,7 +351,7 @@ function schedulePomo() {
       whisperCache = { ts: Date.now(), text: '' };
       const restMin = cfg.restMin || 5;
       const task = pomo.task;
-      void ollamaChat([
+      void chatCompletion([
         { role: 'system', content: NUDGE_SYSTEM },
         { role: 'user', content: `我的任务：${task}；当前阶段：工作结束，该休息了` },
       ], { num_predict: 60 }).then((t) => {
@@ -232,7 +375,7 @@ function schedulePomo() {
       pomo.endsAt = Date.now() + (cfg2.workMin || 25) * 60_000;
       pomo.ts = Date.now();
       workStatus = { state: 'working', task: pomo.task, ts: pomo.ts };
-      void ollamaChat([
+      void chatCompletion([
         { role: 'system', content: NUDGE_SYSTEM },
         { role: 'user', content: `我的任务：${pomo.task}；当前阶段：休息结束，准备开始下一轮` },
       ], { num_predict: 60 }).then((t) => {
@@ -337,6 +480,7 @@ input:focus,select:focus{border-color:var(--accent)}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 .btn.primary:hover{filter:brightness(.95);color:#fff}
 .btn.ghost{background:var(--accent-soft);border-color:transparent;color:var(--accent)}
+.btn:disabled{opacity:.5;cursor:not-allowed;border-color:var(--line);color:var(--muted)}
 .msg{margin:10px 0 0;font-size:12.5px;min-height:18px;color:var(--muted)}
 .msg.ok{color:#6f8f6a}
 .msg.warn{color:#b3352a}
@@ -353,8 +497,9 @@ footer{margin-top:24px;font-size:12px;color:var(--muted);text-align:center}
     <div class="rows">
       <div class="row"><span>服务地址</span><b id="s-addr">—</b></div>
       <div class="row"><span>服务端口</span><b id="s-port">—</b></div>
+      <div class="row"><span>服务构建</span><b id="s-build">—</b></div>
       <div class="row"><span>已运行</span><b id="s-uptime">—</b></div>
-      <div class="row"><span>Ollama 地址</span><b id="s-ollama">—</b></div>
+      <div class="row"><span>AI 服务</span><b id="s-ai">—</b></div>
       <div class="row"><span>当前模型</span><b id="s-model">—</b></div>
       <div class="row"><span>番茄钟</span><b id="s-pomo">—</b></div>
     </div>
@@ -378,14 +523,28 @@ footer{margin-top:24px;font-size:12px;color:var(--muted);text-align:center}
 
   <section class="card">
     <h2>AI 模型</h2>
-    <p class="hint">列表来自本机 Ollama，切换后立即生效（下一句对话即用新模型）。</p>
+    <p class="hint">可接本机 Ollama，也可接任意 OpenAI 兼容服务（OpenAI / DeepSeek / 通义千问 / Moonshot / 硅基流动 等）。保存后立即生效，下一句对话即用新配置。</p>
+    <div class="grid3">
+      <label>服务类型
+        <select id="a-provider">
+          <option value="ollama">本机 Ollama</option>
+          <option value="openai">OpenAI 兼容 API</option>
+        </select>
+      </label>
+      <label>API 地址
+        <input id="a-url" type="text" placeholder="http://localhost:11434">
+      </label>
+      <label>API Key
+        <input id="a-key" type="password" placeholder="本地 Ollama 可留空">
+      </label>
+    </div>
     <div class="actions">
       <select id="m-select" class="grow"></select>
       <button id="m-reload" class="btn ghost">刷新列表</button>
     </div>
     <div class="actions">
       <input id="m-input" type="text" class="grow" placeholder="模型名，如 qwen2.5:3b">
-      <button id="m-save" class="btn primary">切换</button>
+      <button id="m-save" class="btn primary">保存并切换</button>
     </div>
     <p class="msg" id="m-msg"></p>
   </section>
@@ -428,8 +587,9 @@ function applyStatus(d){
   dot.className = 'dot ok';
   $('s-addr').textContent = location.origin + PREFIX;
   $('s-port').textContent = d.port;
+  $('s-build').textContent = d.build ? (d.build + '（本次进程加载的代码）') : '—';
   $('s-uptime').textContent = fmtUptime(d.uptimeMs);
-  $('s-ollama').textContent = d.ollamaUrl || '—';
+  $('s-ai').textContent = (d.provider === 'openai' ? 'OpenAI 兼容 · ' : 'Ollama · ') + (d.aiUrl || '—');
   $('s-model').textContent = d.model || '—';
   var p = d.pomo || {};
   $('s-pomo').textContent = p.state === 'work' ? ('专注中 · ' + (p.task || '') + ' · 剩余 ' + fmtRemain(p.remainMs))
@@ -454,8 +614,20 @@ function loadPomoCfg(){
   });
 }
 function loadModels(auto){
+  // 模型列表只有 Ollama 能枚举：OpenAI 兼容模式下不做无意义的探测，直接提示手填
+  if ($('a-provider').value === 'openai'){
+    var sel0 = $('m-select');
+    sel0.innerHTML = '';
+    var o0 = document.createElement('option');
+    o0.value = '';
+    o0.textContent = '（OpenAI 兼容模式：模型名请手动填写）';
+    sel0.appendChild(o0);
+    sel0.disabled = true;
+    say($('m-msg'), '模型名请按服务商文档填写，例如 deepseek-chat / gpt-4o-mini');
+    return Promise.resolve();
+  }
   if (!auto) say($('m-msg'), '正在读取模型列表…');
-  get('/ai/models').then(function(d){
+  return get('/ai/models').then(function(d){
     var sel = $('m-select');
     sel.innerHTML = '';
     if (d && d.ok && d.models && d.models.length){
@@ -481,6 +653,41 @@ function loadModels(auto){
     }
   }).catch(function(e){ say($('m-msg'), '⚠ 读取失败：' + e.message); });
 }
+// 两种后端的差异只在提示与"能否枚举模型"上，其余输入项完全共用
+var PROVIDER_HINT = {
+  ollama: { url: 'http://localhost:11434', key: '本地 Ollama 可留空' },
+  openai: { url: 'https://api.deepseek.com/v1', key: 'sk-…（按服务商要求填写）' }
+};
+function applyAiProvider(){
+  var p = $('a-provider').value === 'openai' ? 'openai' : 'ollama';
+  $('a-url').placeholder = PROVIDER_HINT[p].url;
+  $('a-key').placeholder = PROVIDER_HINT[p].key;
+  // Ollama 才有可枚举的模型列表；OpenAI 兼容模式刷新按钮与下拉框都无意义
+  $('m-reload').disabled = (p !== 'ollama');
+  if (p === 'openai') $('m-select').disabled = true;
+}
+function loadAiCfg(){
+  get('/ai/config').then(function(d){
+    if (!d || !d.ok){ say($('m-msg'), '⚠ 读取 AI 配置失败'); return; }
+    $('a-provider').value = d.provider === 'openai' ? 'openai' : 'ollama';
+    $('a-url').value = d.url || '';
+    $('a-key').value = d.apiKey || '';
+    $('m-input').value = d.model || '';
+    applyAiProvider();
+    loadModels(true);
+  }).catch(function(e){ say($('m-msg'), '⚠ 读取 AI 配置失败：' + e.message); });
+}
+function isKnownDefaultUrl(v){
+  return !v || v === PROVIDER_HINT.ollama.url || v === PROVIDER_HINT.openai.url;
+}
+$('a-provider').onchange = function(){
+  var p = $('a-provider').value === 'openai' ? 'openai' : 'ollama';
+  // 只在地址还是"空/已知默认值"时换成新后端的默认地址，避免冲掉用户自己填过的地址
+  if (isKnownDefaultUrl($('a-url').value.trim())) $('a-url').value = PROVIDER_HINT[p].url;
+  applyAiProvider();
+  say($('m-msg'), '');
+  loadModels(true);
+};
 $('p-start').onclick = function(){
   post('/pomo/start', {
     task: $('p-task').value.trim() || undefined,
@@ -509,17 +716,23 @@ $('p-save').onclick = function(){
 $('m-select').onchange = function(){ $('m-input').value = $('m-select').value; };
 $('m-reload').onclick = function(){ loadModels(false); };
 $('m-save').onclick = function(){
+  var provider = $('a-provider').value === 'openai' ? 'openai' : 'ollama';
+  var url = $('a-url').value.trim();
   var model = $('m-input').value.trim();
-  if (!model){ say($('m-msg'), '请先选择或输入模型名'); return; }
-  post('/ai/config', {model: model}).then(function(d){
-    if (d && d.ok){
-      say($('m-msg'), '模型已切换为 ' + d.model, true);
-      tick();
-      loadModels(true);
-    } else {
-      say($('m-msg'), '切换失败：' + ((d && d.message) || '未知错误'));
-    }
-  }).catch(function(e){ say($('m-msg'), '切换失败：' + e.message); });
+  if (!url){ say($('m-msg'), '请填写 API 地址'); $('a-url').focus(); return; }
+  if (!model){ say($('m-msg'), '请先选择或输入模型名'); $('m-input').focus(); return; }
+  post('/ai/config', {provider: provider, url: url, model: model, apiKey: $('a-key').value.trim()})
+    .then(function(d){
+      if (d && d.ok){
+        tick();
+        // 先刷新列表，再把保存结果作为最终提示——否则「已保存」会被紧接着的「共 N 个已安装模型」盖掉
+        loadModels(true).then(function(){
+          say($('m-msg'), '已保存：' + (d.provider === 'openai' ? 'OpenAI 兼容' : 'Ollama') + ' · ' + d.model, true);
+        });
+      } else {
+        say($('m-msg'), '保存失败：' + ((d && d.message) || '未知错误'));
+      }
+    }).catch(function(e){ say($('m-msg'), '保存失败：' + e.message); });
 };
 $('o-save').onclick = function(){
   var port = Number($('o-port').value);
@@ -534,7 +747,7 @@ $('o-save').onclick = function(){
 };
 tick();
 loadPomoCfg();
-loadModels(true);
+loadAiCfg();
 setInterval(tick, 2000);
 </script>
 </body></html>`;
@@ -623,9 +836,11 @@ async function handleRoute(url, method, bodyText) {
       json: {
         ok: true,
         port: PORT,
+        build: BUILD,
         uptimeMs: Math.round(process.uptime() * 1000),
         model: aiCfg.model,
-        ollamaUrl: aiCfg.url,
+        provider: aiCfg.provider,
+        aiUrl: aiCfg.url,
         pomo: {
           enabled: getPomoCfg().enabled === true,
           state: pomo.state,
@@ -636,27 +851,47 @@ async function handleRoute(url, method, bodyText) {
     };
   }
 
-  // AI 配置（右键「AI 设置」换模型用）
+  // AI 配置（服务控制台「AI 模型」卡片 / 右键「AI 设置」换模型用）
+  // 局部更新语义：只覆盖 body 里出现的字段——右键弹窗只发 {model}，不会把 provider/url/apiKey 冲掉。
   if (pathname === PREFIX + '/ai/config') {
     if (method === 'POST') {
       try {
         const body = JSON.parse(bodyText || '{}');
+        if (body.provider === 'ollama' || body.provider === 'openai') aiCfg.provider = body.provider;
         if (typeof body.model === 'string' && body.model.trim()) aiCfg.model = body.model.trim();
         if (typeof body.url === 'string' && body.url.trim()) aiCfg.url = body.url.trim().replace(/\/$/, '');
+        // apiKey 允许传空串：从外部 API 切回本机 Ollama 时要能把它清掉
+        if (typeof body.apiKey === 'string') aiCfg.apiKey = body.apiKey.trim();
         saveAiCfg();
-        console.log('[pet-server] AI 配置更新: model=' + aiCfg.model + ' url=' + aiCfg.url);
-        return { json: { ok: true, model: aiCfg.model, url: aiCfg.url } };
+        console.log(
+          '[pet-server] AI 配置更新: provider=' + aiCfg.provider + ' model=' + aiCfg.model + ' url=' + aiCfg.url,
+        );
+        return { json: { ok: true, provider: aiCfg.provider, model: aiCfg.model, url: aiCfg.url, apiKey: aiCfg.apiKey } };
       } catch (e) {
         return { json: { ok: false, message: String(e.message || e) } };
       }
     }
-    return { json: { ok: true, model: aiCfg.model, url: aiCfg.url } };
+    // GET 回传真实 apiKey：服务只监听 127.0.0.1，且控制台要把当前 Key 回填进输入框才能修改
+    return { json: { ok: true, provider: aiCfg.provider, model: aiCfg.model, url: aiCfg.url, apiKey: aiCfg.apiKey } };
   }
 
   // 已安装模型列表（右键「AI 设置」下拉用）：代理 Ollama GET /api/tags。
   // Ollama 不可达时返回 ok:false + 中文原因（弹窗据此提示"Ollama 没起来"），绝不伪造空列表——
   // 空列表会让用户以为"本地没有模型"，而真正的原因是服务没启动。
   if (pathname === PREFIX + '/ai/models') {
+    // 模型列表只有 Ollama 能枚举；OpenAI 兼容服务的可用模型名各家不同（且 /v1/models 支持情况不一），
+    // 如实说明并让用户按服务商文档手填，不去猜一个可能不存在的列表。
+    if (isOpenAi()) {
+      return {
+        json: {
+          ok: false,
+          provider: 'openai',
+          current: aiCfg.model,
+          url: aiCfg.url,
+          message: '当前使用 OpenAI 兼容服务，模型名请按服务商文档手动填写',
+        },
+      };
+    }
     try {
       const res = await fetch(aiCfg.url + '/api/tags', { signal: AbortSignal.timeout(4000) });
       if (!res.ok) {
@@ -725,7 +960,7 @@ async function handleRoute(url, method, bodyText) {
       for (const m of history) messages.push({ role: m.role, content: m.content });
       messages.push({ role: 'user', content: text });
       try {
-        const reply = await ollamaChat(messages, { num_predict: 200 });
+        const reply = await chatCompletion(messages, { num_predict: 200 });
         const list = mem[pet] || [];
         list.push({ role: 'user', content: text, ts: Date.now() });
         list.push({ role: 'assistant', content: reply, ts: Date.now() });
@@ -859,8 +1094,13 @@ server.on('error', (e) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[pet-server] listening on http://127.0.0.1:${PORT}${PREFIX}/`);
+  // 构建标识：日志里能直接看出"这个进程加载的是哪份源码"，排查新旧混跑时不用再猜
+  console.log(`[pet-server] build:    ${BUILD}（本进程启动时加载的源码指纹）`);
   console.log(`[pet-server] config:  http://127.0.0.1:${PORT}${PREFIX}/config`);
   console.log(`[pet-server] assets:  ${WEBM_ROOT}`);
-  console.log(`[pet-server] ollama:  ${aiCfg.url}  model=${aiCfg.model}`);
+  console.log(
+    `[pet-server] ai:      ${providerName()}(${aiCfg.provider}) ${aiCfg.url}  model=${aiCfg.model}` +
+      (aiCfg.apiKey ? '  key=已配置' : ''),
+  );
   console.log(`[pet-server] pomo:    ${getPomoCfg().enabled ? 'ON (' + getPomoCfg().task + ' ' + getPomoCfg().workMin + 'min)' : 'OFF'}`);
 });

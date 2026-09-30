@@ -114,9 +114,17 @@ echo [6/6] 启动本地服务与桌宠 ...
 set "PET_LOG_DIR=%PET_DIR%\.data\logs"
 set "PET_LOG=%PET_LOG_DIR%\pet-server.log"
 set "PET_ERR_LOG=%PET_LOG_DIR%\pet-server.err.log"
-call :probe_health
+rem 端口上若已有 pet-server，必须确认它跑的就是**当前源码**：Node 启动时就把代码读进内存，之后改
+rem 源码不会影响运行中的进程。此前只探测 /health 是否返回 200 就判定"已在运行"并跳过启动，于是几天前
+rem 起的旧服务被静默复用，表现为"桌宠是新版、服务控制台网页还是旧版"。
+rem 现在先比对源码指纹与运行中服务的 build：一致才跳过；不一致则只结束**本项目自己的**
+rem pet-server（命令行含 ollama-pet-server.mjs）再重启，其它程序一概不碰。
+rem 指纹用纯 .NET 算（Get-FileHash 在 cmd 拉起的 powershell 里不可用），取 SHA1 前 12 位，与服务端一致。
+rem 退出码约定：0 = 已在运行且为当前版本（跳过启动）；1 = 需要启动。
+echo       检查端口 %PET_PORT% 上的服务是否为当前版本 ...
+powershell -NoProfile -Command "$port=%PET_PORT%;$local='';try{$local=([System.BitConverter]::ToString([System.Security.Cryptography.SHA1]::Create().ComputeHash([System.IO.File]::ReadAllBytes('%PET_DIR%\scripts\ollama-pet-server.mjs'))) -replace '-','').ToLower().Substring(0,12)}catch{};$running='';try{$running=((Invoke-WebRequest -Uri ('http://127.0.0.1:'+$port+'/dsh-pet-7340/health') -UseBasicParsing -TimeoutSec 2).Content|ConvertFrom-Json).build}catch{};if($running -and $running -eq $local){Write-Output ('      OK - pet-server 已在运行且为当前版本（build '+$local+'），跳过启动');exit 0};foreach($op in (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue|Select-Object -ExpandProperty OwningProcess -Unique)){$pr=Get-CimInstance Win32_Process -Filter ('ProcessId='+$op) -ErrorAction SilentlyContinue;if($pr -and $pr.CommandLine -match 'ollama-pet-server'){Write-Output ('      结束旧版 pet-server（PID '+$op+'）：其代码与当前源码不一致');Stop-Process -Id $op -Force -ErrorAction SilentlyContinue}};for($i=0;$i -lt 24;$i++){if(-not (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)){break};Start-Sleep -Milliseconds 250};exit 1"
 if not errorlevel 1 (
-  echo       OK - pet-server 已在运行（端口 %PET_PORT%），跳过启动
+  echo       跳过启动。
 ) else (
   echo       启动 pet-server（端口 %PET_PORT%）...
   if not exist "%PET_LOG_DIR%" mkdir "%PET_LOG_DIR%" >nul 2>nul
@@ -145,6 +153,9 @@ if not errorlevel 1 (
   )
   echo       OK - pet-server 已就绪（日志：%PET_LOG%）
 )
+rem 把运行中服务**实际加载**的构建指纹与 AI 后端打出来：和「服务控制台」页面的「服务构建」一行、
+rem 以及 .data\logs\pet-server.log 的 build 行对照，即可确认三处看的是同一份代码。
+call :show_server_info
 
 echo.
 echo ------------------------------------------------------------
@@ -168,6 +179,11 @@ if not "!RC_PET!"=="0" (
 echo.
 echo  桌宠已退出。
 pause
+exit /b 0
+
+:show_server_info
+rem 运行中服务的实际身份（构建指纹 + AI 后端）。/health 无 build 字段 = 该进程加载的是加此字段之前的旧代码。
+powershell -NoProfile -Command "try{$j=(Invoke-WebRequest -Uri 'http://127.0.0.1:%PET_PORT%/dsh-pet-7340/health' -UseBasicParsing -TimeoutSec 2).Content|ConvertFrom-Json;Write-Output ('      服务详情 : build ' + $j.build + ' · AI ' + $j.provider + ' · ' + $j.aiUrl + ' · 模型 ' + $j.model)}catch{}" 2>nul
 exit /b 0
 
 :probe_health

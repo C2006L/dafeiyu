@@ -119,6 +119,12 @@ class PetSprite {
     //   光标移到输入框（不在身体命中区）就会被 onMouseMove 翻回穿透，点击全被透传）
     this.chatClose = null;
     this.chatOpen = false;
+    // 自绘弹窗（AI 设置 / 端口设置 / 番茄钟设置）的穿透守卫，语义同 chatOpen。
+    // 漏登记的后果：弹窗开着时光标移到弹窗上（不在身体命中区）会被 onMouseMove 翻回穿透，
+    // 按钮看着正常、点下去全部透传到下层窗口——「取消/保存点了没反应」即由此产生。
+    this.aiSettingsOpen = false;
+    this.portSettingsOpen = false;
+    this.pomoSettingsOpen = false;
 
     // 本地服务连通性（3s 探测 /health；连续失败即气泡告警，恢复后自动收起）
     this.linkDown = false;
@@ -941,7 +947,13 @@ class PetSprite {
    * 位移分不清"拖拽跟手"和"漫游/抛掷"）。所以由渲染端上报，主进程的兜底通道据此闭嘴。
    */
   inputBusy() {
-    return this.dragState.active || this.menuOpen || this.chatOpen;
+    return this.dragState.active || this.menuOpen || this.chatOpen || this.modalOpen();
+  }
+
+  /** 自绘弹窗是否开着（AI 设置 / 端口设置 / 番茄钟设置）。弹窗是窗口内 DOM：开着期间整窗必须保持
+   *  可交互，否则光标移到弹窗上的移动会被 onMouseMove 判成"不在身体命中区"而翻回穿透，按钮点不动。 */
+  modalOpen() {
+    return this.aiSettingsOpen || this.portSettingsOpen || this.pomoSettingsOpen;
   }
 
   /**
@@ -971,8 +983,9 @@ class PetSprite {
       this.setInteractive(true);
       return;
     }
-    // 右键菜单/对话弹窗开启：整窗保持可交互（悬停菜单项/点输入框都不触发穿透翻转）；关闭后恢复命中区判定
-    if (this.menuOpen || this.chatOpen || this.aiSettingsOpen) {
+    // 右键菜单/对话弹窗/自绘设置弹窗开启：整窗保持可交互（悬停菜单项、点弹窗按钮都不触发穿透翻转）；
+    // 全部关闭后恢复命中区判定
+    if (this.menuOpen || this.chatOpen || this.modalOpen()) {
       this.setInteractive(true);
       return;
     }
@@ -1087,7 +1100,7 @@ class PetSprite {
     this.closeMenu();
     if (!leaf || typeof leaf !== 'object') return;
     if (leaf.action === 'ai-settings') {
-      this.showAiSettings(); // 右键随时切换本地 Ollama 模型，立即生效
+      this.showAiSettings(); // 右键随时切换 AI 后端（本机 Ollama / 外部 OpenAI 兼容 API），立即生效
       return;
     }
     if (leaf.action === 'open-console') {
@@ -1232,15 +1245,16 @@ class PetSprite {
     this.setInteractive(true);
   }
 
-  // 「AI 设置」菜单：右键切换本地 Ollama 模型。列表来自服务端 `/ai/models`（代理 Ollama /api/tags）——
-  // 此前是个自由输入框，用户必须凭记忆敲对模型名，敲错只能从"设置失败"里猜，故形同不可用。
-  // Ollama 不可达时**显式提示原因**（而不是给个空列表），并保留手动输入作为兜底。
-  // Electron 无 window.prompt，故自绘弹窗；输入框打开期间整窗保持可交互，关闭时再交还穿透。
+  // 「AI 设置」菜单：右键切换 AI 后端——服务类型（本机 Ollama / OpenAI 兼容 API）、地址、API Key、模型名。
+  // 与「服务控制台」网页的「AI 模型」卡片是同一份配置（都写 `.data/ai.json`），此处只是够用的快捷入口。
+  // 模型列表来自服务端 `/ai/models`（仅 Ollama 可枚举，代理 `/api/tags`）；Ollama 不可达时**显式提示原因**
+  // （而不是给个空列表），并保留手动输入作为兜底——此前是个自由输入框，用户必须凭记忆敲对模型名。
+  // Electron 无 window.prompt，故自绘弹窗；弹窗打开期间整窗保持可交互（见 modalOpen），关闭时再交还穿透。
   async showAiSettings() {
     this.aiSettingsOpen = true;
     this.setInteractive(true);
     this.syncInputBusy();
-    let current = { model: '', url: '' };
+    let current = { provider: 'ollama', model: '', url: '', apiKey: '' };
     try {
       current = await fetch(BASE + '/ai/config', { cache: 'no-store' }).then((r) => r.json());
     } catch (e) {
@@ -1256,20 +1270,71 @@ class PetSprite {
     const root = document.createElement('div');
     root.style.cssText = 'position:fixed;z-index:2147483003;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.10);';
     const box = document.createElement('div');
-    box.style.cssText = 'background:#fff;border-radius:12px;padding:16px 18px;box-shadow:0 10px 32px rgba(0,0,0,.25);font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;min-width:320px;';
-    const label = document.createElement('div');
-    label.textContent = '切换 Ollama 模型（当前：' + (current.model || '未知') + '）';
-    label.style.cssText = 'font-size:13px;color:#555;margin-bottom:10px;';
-    box.appendChild(label);
-    const input = document.createElement('input');
+    // max-height + overflow：弹窗比宠物窗口高时能滚，避免按钮被裁到看不见（窗口只有宠物那么大）
+    box.style.cssText =
+      'background:#fff;border-radius:12px;padding:16px 18px;box-shadow:0 10px 32px rgba(0,0,0,.25);font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;min-width:320px;max-height:96vh;overflow-y:auto;';
+    const title = document.createElement('div');
+    title.textContent =
+      'AI 设置（当前：' +
+      (current.provider === 'openai' ? 'OpenAI 兼容' : 'Ollama') +
+      ' · ' +
+      (current.model || '未知') +
+      '）';
+    title.style.cssText = 'font-size:13px;color:#555;margin-bottom:2px;';
+    box.appendChild(title);
+
+    // 两种后端的默认地址：切换服务类型时，只在地址仍是"空/已知默认值"时替换，避免冲掉用户填过的地址
+    const DEFAULT_URL = { ollama: 'http://localhost:11434', openai: 'https://api.deepseek.com/v1' };
+    const isDefaultUrl = (v) => !v || v === DEFAULT_URL.ollama || v === DEFAULT_URL.openai;
+    const LBL = 'font-size:11px;color:#8a94a6;margin:8px 0 4px;';
+    const FIELD =
+      'width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #d5dbe8;border-radius:8px;font-size:14px;outline:none;';
+    const mkLabel = (text) => {
+      const el = document.createElement('div');
+      el.textContent = text;
+      el.style.cssText = LBL;
+      box.appendChild(el);
+    };
+    const mkInput = (type, cssText) => {
+      const el = document.createElement('input');
+      el.type = type;
+      el.style.cssText = FIELD + (cssText || '');
+      box.appendChild(el);
+      return el;
+    };
+    const WARN_ERR = 'font-size:12px;line-height:1.5;color:#b3352a;background:#fff6f3;border-radius:8px;padding:8px 10px;margin-top:8px;';
+    const WARN_INFO = 'font-size:11px;line-height:1.5;color:#5a6478;background:#f4f6fa;border-radius:8px;padding:8px 10px;margin-top:8px;';
+
+    mkLabel('服务类型');
+    const providerSel = document.createElement('select');
+    providerSel.style.cssText = FIELD + 'background:#fff;';
+    for (const [value, text] of [['ollama', '本机 Ollama'], ['openai', 'OpenAI 兼容 API']]) {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = text;
+      providerSel.appendChild(opt);
+    }
+    providerSel.value = current.provider === 'openai' ? 'openai' : 'ollama';
+    box.appendChild(providerSel);
+
+    mkLabel('API 地址');
+    const urlInput = mkInput('text');
+    urlInput.value = current.url || '';
+    mkLabel('API Key');
+    const keyInput = mkInput('password');
+    keyInput.value = current.apiKey || '';
+    mkLabel('模型名');
+    const input = mkInput('text');
     input.value = current.model || '';
     input.placeholder = '模型名，如 qwen2.5:3b';
-    input.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #d5dbe8;border-radius:8px;font-size:14px;outline:none;';
+
+    // 模型下拉：只有 Ollama 有可枚举列表，且只是**快捷填入**——真值始终以「模型名」输入框为准
+    // （列表可能不含想用的模型，如尚未 pull）
+    const modelsWrap = document.createElement('div');
     const models = Array.isArray(list.models) ? list.models : [];
     if (list.ok && models.length > 0) {
-      // 下拉只是**快捷填入**：真值始终以上面的输入框为准（列表可能不含想用的模型，如尚未 pull）
       const select = document.createElement('select');
-      select.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;margin-bottom:8px;border:1px solid #d5dbe8;border-radius:8px;font-size:14px;outline:none;background:#fff;';
+      select.style.cssText = FIELD + 'background:#fff;margin-top:6px;';
       for (const name of models) {
         const opt = document.createElement('option');
         opt.value = name;
@@ -1280,21 +1345,42 @@ class PetSprite {
       select.onchange = () => {
         input.value = select.value;
       };
-      box.appendChild(select);
+      modelsWrap.appendChild(select);
       const tip = document.createElement('div');
       tip.textContent = '共 ' + models.length + ' 个已安装模型（来自 Ollama）';
-      tip.style.cssText = 'font-size:11px;color:#8a94a6;margin-bottom:8px;';
-      box.appendChild(tip);
-    } else {
-      const warn = document.createElement('div');
-      warn.textContent =
-        '⚠ 拿不到模型列表：' +
-        (list.message || '未知原因') +
-        '。请确认 Ollama 已启动（命令行执行 ollama serve），仍可在下方手动输入模型名。';
-      warn.style.cssText = 'font-size:12px;line-height:1.5;color:#b3352a;background:#fff6f3;border-radius:8px;padding:8px 10px;margin-bottom:8px;';
-      box.appendChild(warn);
+      tip.style.cssText = 'font-size:11px;color:#8a94a6;margin-top:6px;';
+      modelsWrap.appendChild(tip);
     }
-    box.appendChild(input);
+    box.appendChild(modelsWrap);
+
+    // 两种情况都要如实说明，不假装有列表：Ollama 连不上（报原因）/ 外部 API 无法枚举（让人手填）
+    const warn = document.createElement('div');
+    box.appendChild(warn);
+
+    const applyProvider = () => {
+      const p = providerSel.value;
+      urlInput.placeholder = DEFAULT_URL[p];
+      keyInput.placeholder = p === 'openai' ? 'sk-…（按服务商要求填写）' : '本地 Ollama 可留空';
+      modelsWrap.style.display = p === 'ollama' ? '' : 'none';
+      if (p === 'openai') {
+        warn.style.cssText = WARN_INFO;
+        warn.textContent = '模型名请按服务商文档填写（如 deepseek-chat / gpt-4o-mini）——外部服务无法自动枚举模型。';
+      } else if (!list.ok) {
+        warn.style.cssText = WARN_ERR;
+        warn.textContent =
+          '⚠ 拿不到模型列表：' +
+          (list.message || '未知原因') +
+          '。请确认 Ollama 已启动（命令行执行 ollama serve），仍可在上方手动输入模型名。';
+      } else {
+        warn.textContent = '';
+        warn.style.cssText = '';
+      }
+    };
+    applyProvider();
+    providerSel.onchange = () => {
+      if (isDefaultUrl(urlInput.value.trim())) urlInput.value = DEFAULT_URL[providerSel.value];
+      applyProvider();
+    };
     const row = document.createElement('div');
     row.style.cssText = 'margin-top:12px;display:flex;justify-content:flex-end;gap:8px;';
     const cancel = document.createElement('button');
@@ -1311,7 +1397,13 @@ class PetSprite {
     };
     cancel.onclick = finish;
     ok.onclick = async () => {
+      const provider = providerSel.value;
+      const url = urlInput.value.trim();
       const model = input.value.trim();
+      if (!url) {
+        urlInput.focus();
+        return;
+      }
       if (!model) {
         input.focus();
         return;
@@ -1321,13 +1413,13 @@ class PetSprite {
         const res = await fetch(BASE + '/ai/config', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ model }),
+          body: JSON.stringify({ provider, url, model, apiKey: keyInput.value.trim() }),
           cache: 'no-store',
         });
         const data = await res.json();
         if (data && data.ok) {
-          this.showWhisper('模型已切换为 ' + model + '～');
-          console.info('[dsh-pet] AI 模型切换 -> ' + model);
+          this.showWhisper('已切到 ' + (provider === 'openai' ? '外部 API' : '本机 Ollama') + ' · ' + model + '～');
+          console.info('[dsh-pet] AI 后端切换 -> ' + provider + ' / ' + model);
         } else {
           this.showWhisper('设置失败：' + (data && data.message ? data.message : '未知错误'));
         }
@@ -1335,10 +1427,13 @@ class PetSprite {
         this.showWhisper('设置失败：' + (e.message || e));
       }
     };
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') ok.click();
-      if (e.key === 'Escape') finish();
-    });
+    // Enter 提交 / Esc 关闭：只挂在两个"输入型"字段上，避免下拉框上按 Enter 误触发提交
+    for (const el of [urlInput, input]) {
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') ok.click();
+        if (e.key === 'Escape') finish();
+      });
+    }
     root.addEventListener('mousedown', (e) => {
       if (e.target === root) finish();
     });
@@ -1353,6 +1448,7 @@ class PetSprite {
   // 「端口设置…」菜单：读/写服务端口（`.data/server.json`，由启动器在下次启动时传给服务端）。
   // 端口是进程启动参数、运行期不可热改，因此保存后如实告知"重启后生效"（不假装立即切换）。
   async showPortSettings() {
+    this.portSettingsOpen = true;
     this.setInteractive(true);
     this.syncInputBusy();
     let info = { port: 0, configured: 0 };
@@ -1387,6 +1483,7 @@ class PetSprite {
     ok.textContent = '保存';
     ok.style.cssText = 'background:#5686fe;color:#fff;border:none;border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer;';
     const finish = () => {
+      this.portSettingsOpen = false;
       this.syncInputBusy();
       this.setInteractive(false);
       root.remove();
@@ -1469,6 +1566,7 @@ class PetSprite {
   // 「番茄钟 → 设置时长…」：任务名 + 专注/休息分钟数，写回 assets/pomo.json（下次启动同样生效）。
   // 与「AI 设置」同一套自绘弹窗（Electron 无 window.prompt），弹窗期间整窗保持可交互。
   async showPomoSettings() {
+    this.pomoSettingsOpen = true;
     this.setInteractive(true);
     this.syncInputBusy();
     let cfg = { task: '专注', workMin: 25, restMin: 5 };
@@ -1520,6 +1618,7 @@ class PetSprite {
     ok.style.cssText =
       'background:#5686fe;color:#fff;border:none;border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer;';
     const finish = () => {
+      this.pomoSettingsOpen = false;
       this.syncInputBusy();
       this.setInteractive(false); // 弹窗关：恢复命中区穿透
       root.remove();

@@ -967,6 +967,139 @@ app.whenReady().then(() => {
               }
               return out;
             })(),
+            // 端口设置弹窗自检（回归：该弹窗漏登记穿透守卫 → 光标一移上去就被 onMouseMove 翻回穿透，
+            // 「取消/保存」看着正常却点不动）。此时菜单仍开着，直接点「端口设置…」叶子项即可——与真实
+            // 用户点击等价，且动作会先收起菜单（menuOpen=false），正好复现故障前提。
+            portDialogSmoke: await (async function () {
+              var d = window.__dshPetDebug;
+              var menu = document.querySelector('.dsh-pet-menu');
+              if (!d || !menu) return null;
+              var leaves = Array.prototype.slice.call(menu.querySelectorAll('*')).filter(function (el) {
+                return el.children.length === 0 && /端口设置/.test(el.textContent || '');
+              });
+              if (!leaves.length) return null;
+              leaves[0].click();
+              await new Promise(function (r) {
+                setTimeout(r, 400); // 等 GET /server/port 返回后再建弹窗
+              });
+              // 弹窗根节点是 document.body 的直接子元素（无 class），用文案定位
+              var findByText = function (text) {
+                return Array.prototype.slice.call(document.body.children).filter(function (el) {
+                  return (el.textContent || '').indexOf(text) >= 0;
+                })[0];
+              };
+              var dialog = findByText('本地服务端口（当前生效');
+              var out = { menuOpenAfter: d.menuOpen === true, dialogMounted: !!dialog };
+              if (!dialog) return out;
+              // 关键断言：弹窗开着时，光标落在弹窗上（不在身体命中区）必须保持可交互
+              var m = d.winMargin;
+              var r0 = d.hitRect;
+              if (m && r0) {
+                var xOut = Math.max(2, m.l + r0.x - 12);
+                var yOut = Math.max(2, m.t + r0.y - 12);
+                window.dispatchEvent(
+                  new MouseEvent('mousemove', { clientX: xOut, clientY: yOut, screenX: xOut, screenY: yOut }),
+                );
+                out.interactiveAwayFromBody = d.interactive === true;
+              }
+              out.inputBusyWhileOpen = d.inputBusy === true;
+              // 「取消」必须真的响应：点完弹窗消失、忙标记复位
+              var cancel = Array.prototype.slice.call(dialog.querySelectorAll('button')).filter(function (b) {
+                return b.textContent === '取消';
+              })[0];
+              if (cancel) {
+                cancel.click();
+                await new Promise(function (r) {
+                  setTimeout(r, 150);
+                });
+              }
+              out.closedByCancel = !findByText('本地服务端口（当前生效');
+              out.inputBusyAfterClose = d.inputBusy;
+              return out;
+            })(),
+            aiDialogSmoke: await (async function () {
+              var d = window.__dshPetDebug;
+              if (!d) return null;
+              // 前一个块点完菜单项后菜单已被卸载（closeMenu 是移除节点、不是隐藏），故重新唤起
+              var hit = document.querySelector('.pet-hit');
+              if (!hit) return { menuRemounted: false };
+              hit.dispatchEvent(
+                new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: 400, clientY: 260, screenX: 400, screenY: 260 }),
+              );
+              await new Promise(function (r) {
+                setTimeout(r, 300);
+              });
+              var menu = document.querySelector('.dsh-pet-menu');
+              if (!menu) return { menuRemounted: false };
+              var leaves = Array.prototype.slice.call(menu.querySelectorAll('*')).filter(function (el) {
+                return el.children.length === 0 && /AI 设置/.test(el.textContent || '');
+              });
+              if (!leaves.length) return { menuRemounted: true, leafFound: false };
+              leaves[0].click();
+              await new Promise(function (r) {
+                setTimeout(r, 400); // 等 GET /ai/config 与 /ai/models 返回后再建弹窗
+              });
+              // 弹窗根节点是 document.body 的直接子元素（无 class），用标题文案定位
+              var findByText = function (text) {
+                return Array.prototype.slice.call(document.body.children).filter(function (el) {
+                  return (el.textContent || '').indexOf(text) >= 0;
+                })[0];
+              };
+              var dialog = findByText('AI 设置（当前：');
+              var out = { dialogMounted: !!dialog };
+              if (!dialog) return out;
+              // 四项输入必须在：URL / Key(密码型) / 模型名（DOM 顺序即 url → key → model）
+              var inputs = Array.prototype.slice.call(dialog.querySelectorAll('input'));
+              out.inputTypes = inputs.map(function (i) {
+                return i.type;
+              });
+              out.labels = Array.prototype.slice.call(dialog.querySelectorAll('div'))
+                .map(function (el) {
+                  return el.textContent;
+                })
+                .filter(function (t) {
+                  return /^(服务类型|API 地址|API Key|模型名)$/.test(t);
+                });
+              var sel = dialog.querySelector('select');
+              out.providerOptions = sel
+                ? Array.prototype.slice.call(sel.options).map(function (o) {
+                    return o.value;
+                  })
+                : [];
+              // 关键断言：弹窗开着时，光标落在弹窗上（不在身体命中区）必须保持可交互
+              var m = d.winMargin;
+              var r0 = d.hitRect;
+              if (m && r0) {
+                var xOut = Math.max(2, m.l + r0.x - 12);
+                var yOut = Math.max(2, m.t + r0.y - 12);
+                window.dispatchEvent(
+                  new MouseEvent('mousemove', { clientX: xOut, clientY: yOut, screenX: xOut, screenY: yOut }),
+                );
+                out.interactiveAwayFromBody = d.interactive === true;
+              }
+              out.inputBusyWhileOpen = d.inputBusy === true;
+              // 切到外部 API：地址应换成该后端默认值，且提示改为"模型名需手填"
+              if (sel && inputs[0]) {
+                out.urlBeforeSwitch = inputs[0].value;
+                sel.value = 'openai';
+                sel.dispatchEvent(new Event('change'));
+                out.urlAfterSwitch = inputs[0].value;
+                out.warnHasManualHint = /服务商文档/.test(dialog.textContent);
+                out.keyIsPassword = inputs[1] ? inputs[1].type === 'password' : false;
+              }
+              var cancel = Array.prototype.slice.call(dialog.querySelectorAll('button')).filter(function (b) {
+                return b.textContent === '取消';
+              })[0];
+              if (cancel) {
+                cancel.click();
+                await new Promise(function (r) {
+                  setTimeout(r, 150);
+                });
+              }
+              out.closedByCancel = !findByText('AI 设置（当前：');
+              out.inputBusyAfterClose = d.inputBusy;
+              return out;
+            })(),
           }))()`);
           console.log(
             '[dsh-pet-desktop-helper] smoke dump: windows=' +
